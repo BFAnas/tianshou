@@ -13,10 +13,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 from tianshou.data import Collector, ReplayBuffer, VectorReplayBuffer
 from tianshou.policy import DSACPolicy
-from tianshou.trainer import offpolicy_trainer
+from tianshou.trainer import OffpolicyTrainer
 from tianshou.utils import TensorboardLogger, WandbLogger
-from tianshou.utils.net.common import Net, QuantileValueNet
-from tianshou.utils.net.continuous import ActorProb, ImplicitQuantileNetwork
+from tianshou.utils.net.common import Net
+from tianshou.utils.net.continuous import ActorProb
 
 
 class QuantileMlp(nn.Module):
@@ -82,6 +82,7 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="Hopper-v4")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--risk-type", type=str, default="neutral")
     parser.add_argument("--buffer-size", type=int, default=1000000)
     parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256])
     parser.add_argument("--actor-lr", type=float, default=3e-4)
@@ -165,6 +166,7 @@ def test_sac(args=get_args()):
         critic1_optim,
         critic2,
         critic2_optim,
+        risk_type=args.risk_type,
         tau=args.tau,
         gamma=args.gamma,
         alpha=args.alpha,
@@ -190,7 +192,7 @@ def test_sac(args=get_args()):
     # log
     now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
     args.algo_name = "dsac"
-    log_name = os.path.join(args.task, args.algo_name, str(args.seed), now)
+    log_name = os.path.join(args.task, args.algo_name, args.risk_type, str(args.seed), now)
     log_path = os.path.join(args.logdir, log_name)
 
     # logger
@@ -214,20 +216,20 @@ def test_sac(args=get_args()):
 
     if not args.watch:
         # trainer
-        result = offpolicy_trainer(
-            policy,
-            train_collector,
-            test_collector,
-            args.epoch,
-            args.step_per_epoch,
-            args.step_per_collect,
-            args.test_num,
-            args.batch_size,
+        result = OffpolicyTrainer(
+            policy=policy,
+            train_collector=train_collector,
+            test_collector=test_collector,
+            max_epoch=args.epoch,
+            step_per_epoch=args.step_per_epoch,
+            step_per_collect=args.step_per_collect,
+            episode_per_test=args.test_num,
+            batch_size=args.batch_size,
             save_best_fn=save_best_fn,
             logger=logger,
             update_per_step=args.update_per_step,
             test_in_train=False,
-        )
+        ).run()
         pprint.pprint(result)
 
     # Let's watch its performance!

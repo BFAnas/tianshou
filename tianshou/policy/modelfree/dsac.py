@@ -4,7 +4,8 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from tianshou.data import Batch, ReplayBuffer, to_torch
+from tianshou.data import ReplayBuffer, to_torch
+from tianshou.data.types import RolloutBatchProtocol
 from tianshou.policy import SACPolicy
 from tianshou.utils.net.continuous import ActorProb
 
@@ -24,6 +25,10 @@ class DSACPolicy(SACPolicy):
         critic2_optim: torch.optim.Optimizer,
         n_taus: int = 32,
         huber_threshold: float = 1.0,
+        risk_type: str = 'neutral', # ['neutral', 'std', 'var', 'wang', 'cvar', 'cpw']
+        risk_initial_param: float = 1.,
+        risk_final_param: float = 0.,
+        risk_schedule_timesteps: int = 1e6,
         tau: float = 0.005,
         gamma: float = 0.99,
         alpha: Union[float, Tuple[float, torch.Tensor, torch.optim.Optimizer]] = 0.2,
@@ -46,7 +51,14 @@ class DSACPolicy(SACPolicy):
         assert n_taus > 1, "n_taus should be greater than 1"
         self._n_taus = n_taus  # for policy eval
         self._huber_threshold = huber_threshold
+        self._risk_type = risk_type
+        self._risk_param = risk_initial_param
+        self._risk_initial_param = risk_initial_param
+        self._risk_final_param = risk_final_param
+        self._risk_schedule_timesteps = risk_schedule_timesteps
+        self._train_step = 0
 
+    # TODO implement compute_n_return
     def train(self, mode: bool = True) -> "DSACPolicy":
         self.training = mode
         self.actor.train(mode)
@@ -55,9 +67,14 @@ class DSACPolicy(SACPolicy):
         return self
 
     def process_fn(
-        self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
-    ) -> Batch:
+        self, batch: RolloutBatchProtocol, buffer: ReplayBuffer, indices: np.ndarray
+    ) -> RolloutBatchProtocol:
         return batch
+
+    def _update_risk_param(self) -> None:
+        self._risk_schedule_timesteps += 1
+        fraction = min(float(self._train_step) / self._risk_schedule_timesteps, 1.0)
+        self._risk_param = self._risk_initial_param + fraction * (self._risk_final_param - self._risk_initial_param)
 
     @staticmethod
     def _get_taus(batch_size, n_taus, device, dtype):
@@ -97,7 +114,42 @@ class DSACPolicy(SACPolicy):
         rho = torch.abs(tau - sign) * L * weight
         return rho.sum(dim=-1).mean()
 
-    def _target_z(self, batch: Batch) -> Tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _normal_cdf(value, loc=0., scale=1.):
+        return 0.5 * (1 + torch.erf((value - loc) / scale / np.sqrt(2)))
+
+    @staticmethod
+    def _normal_icdf(value, loc=0., scale=1.):
+        return loc + scale * torch.erfinv(2 * value - 1) * np.sqrt(2)
+
+    @staticmethod
+    def _normal_pdf(value, loc=0., scale=1.):
+        return torch.exp(-(value - loc)**2 / (2 * scale**2)) / scale / np.sqrt(2 * np.pi)    
+
+    def _distortion_de(self, taus, mode="neutral", param=0., eps=1e-8):
+        # Derivative of Risk distortion function
+        taus = taus.clamp(0., 1.)
+        if param >= 0:
+            if mode == "neutral":
+                taus_ = torch.ones_like(taus)
+            elif mode == "wang":
+                taus_ = self._normal_pdf(self._normal_icdf(taus) + param) / (self._normal_pdf(self._normal_icdf(taus)) + eps)
+            elif mode == "cvar":
+                taus_ = (1. / param) * (taus < param)
+            elif mode == "cpw":
+                g = taus**param
+                h = (taus**param + (1 - taus)**param)**(1 / param)
+                g_ = param * taus**(param - 1)
+                h_ = (taus**param + (1 - taus)**param)**(1 / param - 1) * (taus**(param - 1) - (1 - taus)**(param - 1))
+                taus_ = (g_ * h - g * h_) / (h**2 + eps)
+            else:
+                raise f"risk type {mode} not in supported list: ['neutral', 'std', 'var', 'wang', 'cvar', 'cpw']"
+            return taus_.clamp(0., 5.).to(taus.device)
+
+        else:
+            return self._distortion_de(1 - taus, mode, -param)
+
+    def _target_z(self, batch: RolloutBatchProtocol) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = len(batch)
         obs_next_result = self(batch, input="obs_next")
         act_ = obs_next_result.act
@@ -120,8 +172,8 @@ class DSACPolicy(SACPolicy):
         return target_z, presum_taus
 
     def _z_optimizer(
-        self, batch: Batch, critic: torch.nn.Module, optimizer: torch.optim.Optimizer
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self, batch: RolloutBatchProtocol, critic: torch.nn.Module, optimizer: torch.optim.Optimizer
+    ) -> torch.Tensor:
         """A simple wrapper script for updating critic network."""
         batch_size = len(batch)
         taus_hat_j, _ = self._get_taus(
@@ -129,7 +181,7 @@ class DSACPolicy(SACPolicy):
         )
         current_z = critic(batch.obs, batch.act, taus_hat_j)
         with torch.no_grad():
-            target_z, presum_taus_i = self._target_q(batch)
+            target_z, presum_taus_i = self._target_z(batch)
 
         loss = self._quantile_regression_loss(
             current_z, target_z, taus_hat_j, presum_taus_i
@@ -139,8 +191,8 @@ class DSACPolicy(SACPolicy):
         optimizer.step()
         return loss
 
-    def learn(self, batch: Batch, **kwargs: Any) -> Dict[str, float]:
-        batch: Batch = to_torch(batch, dtype=torch.float, device=self.device)
+    def learn(self, batch: RolloutBatchProtocol, **kwargs: Any) -> Dict[str, float]:
+        batch: RolloutBatchProtocol = to_torch(batch, dtype=torch.float, device=self.device)
         # critic 1&2
         critic1_loss = self._z_optimizer(
             batch, self.critic1, self.critic1_optim
@@ -150,16 +202,33 @@ class DSACPolicy(SACPolicy):
         # actor
         obs_result = self(batch)
         act = obs_result.act
-        with torch.no_grad():
-            taus_hat, presum_taus = self._get_taus(
-                len(batch), self._n_taus, batch.obs.device, batch.obs.dtype
-            )
-        current_z1a = self.critic1(batch.obs, act, taus_hat)
-        current_z2a = self.critic2(batch.obs, act, taus_hat)
-        z1a = torch.sum(presum_taus * current_z1a, dim=1, keepdim=True)
-        z2a = torch.sum(presum_taus * current_z2a, dim=1, keepdim=True)
-        za = torch.min(z1a, z2a)
-        actor_loss = (self._alpha * obs_result.log_prob.flatten() - za).mean()
+        # get Q for given risk type
+        if self._risk_type == 'var':
+            taus = torch.ones_like(batch.rew, device=batch.rew.device)
+            q1a = self.critic1(batch.obs, act, taus)
+            q2a = self.critic2(batch.obs, act, taus)
+        else:
+            with torch.no_grad():
+                taus_hat, presum_taus = self._get_taus(
+                    len(batch), self._n_taus, batch.obs.device, batch.obs.dtype
+                )
+            z1a = self.critic1(batch.obs, act, taus_hat)
+            z2a = self.critic2(batch.obs, act, taus_hat)
+            if self._risk_type in ['neutral', 'std']:
+                q1a = torch.sum(presum_taus * z1a, dim=1, keepdim=True)
+                q2a = torch.sum(presum_taus * z2a, dim=1, keepdim=True)
+                if self._risk_type == 'std':
+                    q1a_std = presum_taus * (z1a - q1a).pow(2)
+                    q2a_std = presum_taus * (z2a - q2a).pow(2)
+                    q1a -= self._risk_param * q1a_std.sum(dim=1, keepdims=True).sqrt()
+                    q2a -= self._risk_param * q2a_std.sum(dim=1, keepdims=True).sqrt()
+            else:
+                with torch.no_grad():
+                    risk_weights = self._distortion_de(taus_hat, self._risk_type, self._risk_param)
+                q1a = torch.sum(risk_weights * presum_taus * z1a, dim=1, keepdim=True)
+                q2a = torch.sum(risk_weights* presum_taus * z2a, dim=1, keepdim=True)
+        qa = torch.min(q1a, q2a)
+        actor_loss = (self._alpha * obs_result.log_prob.flatten() - qa).mean()
         self.actor_optim.zero_grad()
         actor_loss.backward()
         self.actor_optim.step()
@@ -174,6 +243,7 @@ class DSACPolicy(SACPolicy):
             self._alpha = self._log_alpha.detach().exp()
 
         self.sync_weight()
+        self._update_risk_param()
 
         result = {
             "loss/actor": actor_loss.item(),
