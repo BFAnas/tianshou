@@ -48,6 +48,7 @@ class DSACPolicy(SACPolicy):
             **kwargs
         )
         self.device = device
+        assert risk_type in ['neutral', 'std', 'var', 'wang', 'cvar', 'cpw'], "risk_type should be one of ['neutral', 'std', 'var', 'wang', 'cvar', 'cpw']"
         assert n_taus > 1, "n_taus should be greater than 1"
         self._n_taus = n_taus  # for policy eval
         self._huber_threshold = huber_threshold
@@ -204,7 +205,7 @@ class DSACPolicy(SACPolicy):
         act = obs_result.act
         # get Q for given risk type
         if self._risk_type == 'var':
-            taus = torch.ones_like(batch.rew, device=batch.rew.device)
+            taus = torch.ones_like(batch.rew, device=batch.rew.device) * self._risk_param
             q1a = self.critic1(batch.obs, act, taus)
             q2a = self.critic2(batch.obs, act, taus)
         else:
