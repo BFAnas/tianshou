@@ -16,67 +16,7 @@ from tianshou.policy import DSACPolicy
 from tianshou.trainer import OffpolicyTrainer
 from tianshou.utils import TensorboardLogger, WandbLogger
 from tianshou.utils.net.common import Net
-from tianshou.utils.net.continuous import ActorProb
-
-
-class QuantileMlp(nn.Module):
-
-    def __init__(
-            self,
-            hidden_sizes,
-            input_size,
-            embedding_size=64,
-            num_quantiles=32,
-            layer_norm=True,
-            device='cpu',
-            **kwargs,
-    ):
-        super().__init__()
-        self.layer_norm = layer_norm
-        # hidden_sizes[:-2] MLP base
-        # hidden_sizes[-2] before merge
-        # hidden_sizes[-1] before output
-
-        self.base_fc = []
-        last_size = input_size
-        for next_size in hidden_sizes[:-1]:
-            self.base_fc += [
-                nn.Linear(last_size, next_size),
-                nn.LayerNorm(next_size) if layer_norm else nn.Identity(),
-                nn.ReLU(inplace=True),
-            ]
-            last_size = next_size
-        self.base_fc = nn.Sequential(*self.base_fc)
-        self.num_quantiles = num_quantiles
-        self.embedding_size = embedding_size
-        self.tau_fc = nn.Sequential(
-            nn.Linear(embedding_size, last_size),
-            nn.LayerNorm(last_size) if layer_norm else nn.Identity(),
-            nn.Sigmoid(),
-        )
-        self.merge_fc = nn.Sequential(
-            nn.Linear(last_size, hidden_sizes[-1]),
-            nn.LayerNorm(hidden_sizes[-1]) if layer_norm else nn.Identity(),
-            nn.ReLU(inplace=True),
-        )
-        self.last_fc = nn.Linear(hidden_sizes[-1], 1)
-        self.const_vec = torch.Tensor(np.arange(1, 1 + self.embedding_size)).to(device)
-
-    def forward(self, state, action, tau):
-        """
-        Calculate Quantile Value in Batch
-        tau: quantile fractions, (N, T)
-        """
-        h = torch.cat([state, action], dim=1)
-        h = self.base_fc(h)  # (N, C)
-
-        x = torch.cos(tau.unsqueeze(-1) * self.const_vec * np.pi)  # (N, T, E)
-        x = self.tau_fc(x)  # (N, T, C)
-
-        h = torch.mul(x, h.unsqueeze(-2))  # (N, T, C)
-        h = self.merge_fc(h)  # (N, T, C)
-        output = self.last_fc(h).squeeze(-1)  # (N, T)
-        return output
+from tianshou.utils.net.continuous import ActorProb, QuantileMlp
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -106,6 +46,7 @@ def get_args():
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
+    parser.add_argument("--gpu-to-use", type=int, default=0)
     parser.add_argument("--resume-path", type=str, default=None)
     parser.add_argument("--resume-id", type=str, default=None)
     parser.add_argument(
@@ -125,6 +66,8 @@ def get_args():
 
 
 def test_sac(args=get_args()):
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu_to_use)
     env, train_envs, test_envs = make_mujoco_env(
         args.task, args.seed, args.training_num, args.test_num, obs_norm=False
     )
