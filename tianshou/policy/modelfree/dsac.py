@@ -172,10 +172,9 @@ class DSACPolicy(SACPolicy):
         )
         return target_z, presum_taus
 
-    def _z_optimizer(
-        self, batch: RolloutBatchProtocol, critic: torch.nn.Module, optimizer: torch.optim.Optimizer
-    ) -> torch.Tensor:
-        """A simple wrapper script for updating critic network."""
+    def _critic_loss(
+        self, batch: RolloutBatchProtocol, critic: torch.nn.Module
+        ) -> torch.Tensor:
         batch_size = len(batch)
         taus_hat_j, _ = self._get_taus(
             batch_size, self._n_taus, batch.obs.device, batch.obs.dtype
@@ -187,23 +186,12 @@ class DSACPolicy(SACPolicy):
         loss = self._quantile_regression_loss(
             current_z, target_z, taus_hat_j, presum_taus_i
         )
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
         return loss
-
-    def learn(self, batch: RolloutBatchProtocol, **kwargs: Any) -> Dict[str, float]:
-        batch: RolloutBatchProtocol = to_torch(batch, dtype=torch.float, device=self.device)
-        # critic 1&2
-        critic1_loss = self._z_optimizer(
-            batch, self.critic1, self.critic1_optim
-        )
-        critic2_loss = self._z_optimizer(batch, self.critic2, self.critic2_optim)
-
-        # actor
-        obs_result = self(batch)
-        act = obs_result.act
-        # get Q for given risk type
+    
+    def _q_risk(
+        self, batch: RolloutBatchProtocol, act: torch.Tensor
+    ) -> (torch.Tensor, torch.Tensor):
+        # get Q for risk type
         if self._risk_type == 'var':
             taus = torch.ones_like(batch.rew, device=batch.rew.device) * self._risk_param
             q1a = self.critic1(batch.obs, act, taus)
@@ -229,6 +217,24 @@ class DSACPolicy(SACPolicy):
                 q1a = torch.sum(risk_weights * presum_taus * z1a, dim=1, keepdim=True)
                 q2a = torch.sum(risk_weights* presum_taus * z2a, dim=1, keepdim=True)
         qa = torch.min(q1a, q2a)
+        return qa
+
+    def learn(self, batch: RolloutBatchProtocol, **kwargs: Any) -> Dict[str, float]:
+        batch: RolloutBatchProtocol = to_torch(batch, dtype=torch.float, device=self.device)
+        # critic 1&2
+        critic1_loss = self._critic_loss(batch, self.critic1)
+        critic2_loss = self._critic_loss(batch, self.critic2)
+        self.critic1_optim.zero_grad()
+        critic1_loss.backward()
+        self.critic1_optim.step()
+        self.critic2_optim.zero_grad()
+        critic2_loss.backward()
+        self.critic2_optim.step()
+
+        # actor
+        obs_result = self(batch)
+        act = obs_result.act
+        qa = self._q_risk(batch, act)
         actor_loss = (self._alpha * obs_result.log_prob.flatten() - qa).mean()
         self.actor_optim.zero_grad()
         actor_loss.backward()
