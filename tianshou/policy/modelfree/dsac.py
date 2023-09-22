@@ -48,7 +48,7 @@ class DSACPolicy(SACPolicy):
             **kwargs
         )
         self.device = device
-        assert risk_type in ['neutral', 'std', 'var', 'wang', 'cvar', 'cpw'], "risk_type should be one of ['neutral', 'std', 'var', 'wang', 'cvar', 'cpw']"
+        assert risk_type in ['neutral', 'std', 'var', 'wang', 'cvar', 'cpw'], f"risk_type should be one of ['neutral', 'std', 'var', 'wang', 'cvar', 'cpw'] was given {risk_type}"
         assert n_taus > 1, "n_taus should be greater than 1"
         self._n_taus = n_taus  # for policy eval
         self._huber_threshold = huber_threshold
@@ -90,10 +90,9 @@ class DSACPolicy(SACPolicy):
         )
         presum_taus /= presum_taus.sum(dim=-1, keepdim=True)
         taus = torch.cumsum(presum_taus, dim=1)
-        with torch.no_grad():
-            taus_hat = torch.zeros_like(taus).to(device)
-            taus_hat[:, 0:1] = taus[:, 0:1] / 2.0
-            taus_hat[:, 1:] = (taus[:, 1:] + taus[:, :-1]) / 2.0
+        taus_hat = torch.zeros_like(taus).to(device)
+        taus_hat[:, 0:1] = taus[:, 0:1] / 2.0
+        taus_hat[:, 1:] = (taus[:, 1:] + taus[:, :-1]) / 2.0
         return taus_hat, presum_taus
 
     @staticmethod
@@ -197,10 +196,9 @@ class DSACPolicy(SACPolicy):
             q1a = self.critic1(batch.obs, act, taus)
             q2a = self.critic2(batch.obs, act, taus)
         else:
-            with torch.no_grad():
-                taus_hat, presum_taus = self._get_taus(
-                    len(batch), self._n_taus, batch.obs.device, batch.obs.dtype
-                )
+            taus_hat, presum_taus = self._get_taus(
+                len(batch), self._n_taus, batch.obs.device, batch.obs.dtype
+            )
             z1a = self.critic1(batch.obs, act, taus_hat)
             z2a = self.critic2(batch.obs, act, taus_hat)
             if self._risk_type in ['neutral', 'std']:
@@ -212,8 +210,7 @@ class DSACPolicy(SACPolicy):
                     q1a -= self._risk_param * q1a_std.sum(dim=1, keepdims=True).sqrt()
                     q2a -= self._risk_param * q2a_std.sum(dim=1, keepdims=True).sqrt()
             else:
-                with torch.no_grad():
-                    risk_weights = self._distortion_de(taus_hat, self._risk_type, self._risk_param)
+                risk_weights = self._distortion_de(taus_hat, self._risk_type, self._risk_param)
                 q1a = torch.sum(risk_weights * presum_taus * z1a, dim=1, keepdim=True)
                 q2a = torch.sum(risk_weights* presum_taus * z2a, dim=1, keepdim=True)
         qa = torch.min(q1a, q2a)
