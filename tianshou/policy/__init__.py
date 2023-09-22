@@ -24,6 +24,7 @@ from tianshou.policy.modelfree.discrete_sac import DiscreteSACPolicy
 from tianshou.policy.imitation.base import ImitationPolicy
 from tianshou.policy.imitation.bcq import BCQPolicy
 from tianshou.policy.imitation.cql import CQLPolicy
+from tianshou.policy.imitation.codac import CODACPolicy
 from tianshou.policy.imitation.td3_bc import TD3BCPolicy
 from tianshou.policy.imitation.discrete_bcq import DiscreteBCQPolicy
 from tianshou.policy.imitation.discrete_cql import DiscreteCQLPolicy
@@ -57,6 +58,7 @@ __all__ = [
     "ImitationPolicy",
     "BCQPolicy",
     "CQLPolicy",
+    "CODACPolicy",
     "TD3BCPolicy",
     "DiscreteBCQPolicy",
     "DiscreteCQLPolicy",

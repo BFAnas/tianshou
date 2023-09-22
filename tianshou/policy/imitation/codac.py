@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 
-from tianshou.data import Batch, ReplayBuffer, to_torch
+from tianshou.data import to_torch, to_torch_as, Batch
 from tianshou.data.types import RolloutBatchProtocol
 from tianshou.policy import DSACPolicy
 from tianshou.utils.net.continuous import ActorProb
@@ -38,14 +38,12 @@ class CODACPolicy(DSACPolicy):
         alpha_max: float = 1e6,
         clip_grad: float = 1.0,
         calibrated: bool = False,
-        omega: float = 1.0,
-        zeta: float = 10.0,
         device: Union[str, torch.device] = "cpu",
         **kwargs: Any
     ) -> None:
         super().__init__(
-            actor, actor_optim, critic1, critic1_optim, critic2, critic2_optim, tau,
-            gamma, alpha, **kwargs
+            actor, actor_optim, critic1, critic1_optim, critic2, critic2_optim, tau=tau,
+            gamma=gamma, alpha=alpha, **kwargs
         )
         # There are _target_entropy, _log_alpha, _alpha_optim in SACPolicy.
         self.device = device
@@ -69,8 +67,6 @@ class CODACPolicy(DSACPolicy):
         self.clip_grad = clip_grad
 
         self.calibrated = calibrated
-        self.omega = omega
-        self.zeta = zeta
 
     def train(self, mode: bool = True) -> "CODACPolicy":
         """Set the module in training mode, except for the target network."""
@@ -80,13 +76,15 @@ class CODACPolicy(DSACPolicy):
         self.critic2.train(mode)
         return self
 
+    def actor_pred(self, obs: torch.Tensor) -> \
+            Tuple[torch.Tensor, torch.Tensor]:
+        batch = Batch(obs=obs, info=None)
+        obs_result = self(batch)
+        return obs_result.act, obs_result.log_prob
+    
     def _critic_loss(
-        self, batch: RolloutBatchProtocol, critic: torch.nn.Module
+        self, batch: RolloutBatchProtocol, critic: torch.nn.Module, taus_hat_j
         ) -> (torch.Tensor, torch.Tensor):
-        batch_size = len(batch)
-        taus_hat_j, _ = self._get_taus(
-            batch_size, self._n_taus, batch.obs.device, batch.obs.dtype
-        )
         current_z = critic(batch.obs, batch.act, taus_hat_j)
         with torch.no_grad():
             target_z, presum_taus_i = self._target_z(batch)
@@ -96,17 +94,49 @@ class CODACPolicy(DSACPolicy):
         )
         return current_z, loss
 
+    def repeat_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor_len = len(tensor.shape)
+        repeat_size = [1, self.num_repeat_actions] + [1] * (tensor_len - 1)
+        view_size = [tensor.shape[0] * self.num_repeat_actions] + list(tensor.shape[1:])
+        return tensor.unsqueeze(1).repeat(*repeat_size).view(*view_size)  
+
+    def _calc_pi_values(self, obs_pi: torch.Tensor, obs_to_pred: torch.Tensor, taus_hat_j) -> \
+            Tuple[torch.Tensor, torch.Tensor]:
+        act_pred, log_pi = self.actor_pred(obs_pi)
+        log_pi = log_pi.repeat((1, self._n_taus))
+
+        z1 = self.critic1(obs_to_pred, act_pred, taus_hat_j)
+        z2 = self.critic2(obs_to_pred, act_pred, taus_hat_j)
+
+        return z1 - log_pi.detach(), z2 - log_pi.detach()
+
+    def _calc_random_values(self, obs: torch.Tensor, act: torch.Tensor, taus_hat_j) -> \
+            Tuple[torch.Tensor, torch.Tensor]:
+        random_value1 = self.critic1(obs, act, taus_hat_j)
+        random_log_prob1 = np.log(0.5**act.shape[-1]).repeat(self._n_taus).reshape(1, self._n_taus)
+        random_log_prob1 = to_torch_as(random_log_prob1, random_value1)
+
+        random_value2 = self.critic2(obs, act, taus_hat_j)
+        random_log_prob2 = np.log(0.5**act.shape[-1]).repeat(self._n_taus).reshape(1, self._n_taus)
+        random_log_prob2 = to_torch_as(random_log_prob2, random_value2)
+
+        return random_value1 - random_log_prob1, random_value2 - random_log_prob2
+
     def learn(self, batch: RolloutBatchProtocol, *args: Any,
               **kwargs: Any) -> Dict[str, float]:
-        batch: Batch = to_torch(batch, dtype=torch.float, device=self.device)
+        batch: RolloutBatchProtocol = to_torch(batch, dtype=torch.float, device=self.device)
         obs, act, rew, obs_next = batch.obs, batch.act, batch.rew, batch.obs_next
-        batch_size = obs.shape[0]
+        batch_size = len(batch)
+        taus_hat_j, _ = self._get_taus(
+            batch_size, self._n_taus, batch.obs.device, batch.obs.dtype
+        )
 
         # compute actor loss and update actor
         obs_result = self(batch)
         act = obs_result.act
         qa = self._q_risk(batch, act)
-        actor_loss = (self._alpha * obs_result.log_prob.flatten() - qa).mean()
+        log_pi = obs_result.log_prob
+        actor_loss = (self._alpha * log_pi.flatten() - qa).mean()
         self.actor_optim.zero_grad()
         actor_loss.backward()
         self.actor_optim.step()
@@ -123,45 +153,42 @@ class CODACPolicy(DSACPolicy):
             self._alpha = self._log_alpha.detach().exp()
 
         # compute critics loss
-        current_z1, critic1_loss = self._critic_loss(batch, self.critic1)
-        current_z2, critic2_loss = self._critic_loss(batch, self.critic2)
+        current_z1, critic1_loss = self._critic_loss(batch, self.critic1, taus_hat_j)
+        current_z2, critic2_loss = self._critic_loss(batch, self.critic2, taus_hat_j)
 
         # CQL
         random_actions = torch.FloatTensor(
             batch_size * self.num_repeat_actions, act.shape[-1]
         ).uniform_(-self.min_action, self.max_action).to(self.device)
 
-        # TODO: implement calc_pi_values and calc_random_values
-        obs_len = len(obs.shape)
-        repeat_size = [1, self.num_repeat_actions] + [1] * (obs_len - 1)
-        view_size = [batch_size * self.num_repeat_actions] + list(obs.shape[1:])
-        tmp_obs = obs.unsqueeze(1).repeat(*repeat_size).view(*view_size)
-        tmp_obs_next = obs_next.unsqueeze(1).repeat(*repeat_size).view(*view_size)
+        tmp_obs = self.repeat_tensor(obs)
+        tmp_obs_next = self.repeat_tensor(obs_next)
+        taus_hat_j = self.repeat_tensor(taus_hat_j)
         # tmp_obs & tmp_obs_next: (batch_size * num_repeat, state_dim)
 
-        current_pi_value1, current_pi_value2 = self.calc_pi_values(tmp_obs, tmp_obs)
-        next_pi_value1, next_pi_value2 = self.calc_pi_values(tmp_obs_next, tmp_obs)
+        current_pi_value1, current_pi_value2 = self._calc_pi_values(tmp_obs, tmp_obs, taus_hat_j)
+        next_pi_value1, next_pi_value2 = self._calc_pi_values(tmp_obs_next, tmp_obs, taus_hat_j)
 
-        random_value1, random_value2 = self.calc_random_values(tmp_obs, random_actions)
+        random_value1, random_value2 = self._calc_random_values(tmp_obs, random_actions, taus_hat_j)
 
         for value in [
             current_pi_value1, current_pi_value2, next_pi_value1, next_pi_value2,
             random_value1, random_value2
         ]:
-            value.reshape(batch_size, self.num_repeat_actions, 1)
+            value.reshape(batch_size, self.num_repeat_actions, self._n_taus)
 
         # cat q values
         cat_q1 = torch.cat([random_value1, current_pi_value1, next_pi_value1], 1)
         cat_q2 = torch.cat([random_value2, current_pi_value2, next_pi_value2], 1)
-        # shape: (batch_size, 3 * num_repeat, 1)
+        # shape: (batch_size, 3 * num_repeat, n_taus)
 
         cql1_scaled_loss = \
             torch.logsumexp(cat_q1 / self.temperature, dim=1).mean() * \
-            self.cql_weight * self.temperature - current_Q1.mean() * \
+            self.cql_weight * self.temperature - current_z1.mean() * \
             self.cql_weight
         cql2_scaled_loss = \
             torch.logsumexp(cat_q2 / self.temperature, dim=1).mean() * \
-            self.cql_weight * self.temperature - current_Q2.mean() * \
+            self.cql_weight * self.temperature - current_z2.mean() * \
             self.cql_weight
         # shape: (1)
 
