@@ -11,7 +11,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from examples.offline.utils import load_buffer_d4rl
-from tianshou.data import Batch, Collector, ReplayBuffer
+from tianshou.data import Collector
 from tianshou.env import SubprocVectorEnv
 from tianshou.policy import CODACPolicy
 from tianshou.trainer import OfflineTrainer
@@ -41,7 +41,7 @@ def get_args():
 
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--cql-weight", type=float, default=1.0)
+    parser.add_argument("--cql-weight", type=float, default=5.0)
     parser.add_argument("--with-lagrange", type=bool, default=True)
     parser.add_argument("--calibrated", type=bool, default=True)
     parser.add_argument("--lagrange-threshold", type=float, default=10.0)
@@ -51,6 +51,7 @@ def get_args():
     parser.add_argument("--test-num", type=int, default=10)
     parser.add_argument("--logdir", type=str, default="log")
     parser.add_argument("--render", type=float, default=1 / 35)
+    parser.add_argument("--gpu-to-use", type=int, default=0)
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -73,6 +74,8 @@ def get_args():
 
 def test_cql():
     args = get_args()
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu_to_use)
     env = gym.make(args.task)
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
@@ -150,7 +153,7 @@ def test_cql():
 
     # log
     now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
-    args.algo_name = "cql"
+    args.algo_name = "codac"
     log_name = os.path.join(args.task, args.algo_name, str(args.seed), now)
     log_path = os.path.join(args.logdir, log_name)
 
