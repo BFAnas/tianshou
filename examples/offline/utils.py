@@ -1,7 +1,8 @@
 from typing import Tuple
 
 import d4rl
-import gymnasium as gym
+import d4rl.gym_mujoco
+import gym
 import h5py
 import numpy as np
 
