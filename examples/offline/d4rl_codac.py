@@ -22,9 +22,9 @@ from tianshou.utils.net.continuous import ActorProb, QuantileMlp
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", type=str, default="HalfCheetah-v2")
+    parser.add_argument("--task", type=str, default="Hopper-v2")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--expert-data-task", type=str, default="halfcheetah-expert-v2")
+    parser.add_argument("--expert-data-task", type=str, default="hopper-medium-v2")
     parser.add_argument("--buffer-size", type=int, default=1000000)
     parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256])
     parser.add_argument("--actor-lr", type=float, default=1e-4)
@@ -38,11 +38,12 @@ def get_args():
     parser.add_argument("--step-per-epoch", type=int, default=5000)
     parser.add_argument("--n-step", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--risk-type", type=str, default='neutral')
 
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cql-weight", type=float, default=5.0)
-    parser.add_argument("--with-lagrange", type=bool, default=True)
+    parser.add_argument("--with-lagrange", type=bool, default=False)
     parser.add_argument("--calibrated", type=bool, default=True)
     parser.add_argument("--lagrange-threshold", type=float, default=10.0)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -53,7 +54,7 @@ def get_args():
     parser.add_argument("--render", type=float, default=1 / 35)
     parser.add_argument("--gpu-to-use", type=int, default=0)
     parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+        "--device", type=str, default="cuda:1" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--resume-path", type=str, default=None)
     parser.add_argument("--resume-id", type=str, default=None)
@@ -129,6 +130,7 @@ def test_cql():
         critic2=critic2,
         critic2_optim=critic2_optim,
         action_space=env.action_space,
+        risk_type=args.risk_type,
         cql_alpha_lr=args.cql_alpha_lr,
         cql_weight=args.cql_weight,
         tau=args.tau,

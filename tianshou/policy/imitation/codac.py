@@ -162,35 +162,37 @@ class CODACPolicy(DSACPolicy):
         ).uniform_(-self.min_action, self.max_action).to(self.device)
 
         tmp_obs = self.repeat_tensor(obs)
-        tmp_obs_next = self.repeat_tensor(obs_next)
         taus_hat_j = self.repeat_tensor(taus_hat_j)
-        # tmp_obs & tmp_obs_next: (batch_size * num_repeat, state_dim)
+        # tmp_obs: (batch_size * num_repeat, state_dim)
+        # taus_hat_j: (batch_size * num_repeat, n_taus)
 
         current_pi_value1, current_pi_value2 = self._calc_pi_values(tmp_obs, tmp_obs, taus_hat_j)
-        next_pi_value1, next_pi_value2 = self._calc_pi_values(tmp_obs_next, tmp_obs, taus_hat_j)
-
         random_value1, random_value2 = self._calc_random_values(tmp_obs, random_actions, taus_hat_j)
 
-        for value in [
-            current_pi_value1, current_pi_value2, next_pi_value1, next_pi_value2,
-            random_value1, random_value2
-        ]:
-            value.reshape(batch_size, self.num_repeat_actions, self._n_taus)
+        current_pi_value1 = current_pi_value1.reshape(batch_size, self.num_repeat_actions, self._n_taus)
+        current_pi_value2 = current_pi_value2.reshape(batch_size, self.num_repeat_actions, self._n_taus)
+        random_value1 = random_value1.reshape(batch_size, self.num_repeat_actions, self._n_taus)
+        random_value2 = random_value2.reshape(batch_size, self.num_repeat_actions, self._n_taus)
 
         # cat q values
-        cat_q1 = torch.cat([random_value1, current_pi_value1, next_pi_value1], 1)
-        cat_q2 = torch.cat([random_value2, current_pi_value2, next_pi_value2], 1)
-        # shape: (batch_size, 3 * num_repeat, n_taus)
+        cat_q1 = torch.cat([random_value1, current_pi_value1], 1)
+        cat_q2 = torch.cat([random_value2, current_pi_value2], 1)
+        # shape: (batch_size, 2 * num_repeat, n_taus)
 
+        zero_tensor = to_torch_as(torch.Tensor([0]), cat_q1)
         cql1_scaled_loss = \
-            torch.logsumexp(cat_q1 / self.temperature, dim=1).mean() * \
-            self.cql_weight * self.temperature - current_z1.mean() * \
-            self.cql_weight
+            torch.logsumexp(cat_q1 / self.temperature, dim=1) * \
+                self.temperature - current_z1
+        cql1_scaled_loss = cql1_scaled_loss.mean()
+        cql1_scaled_loss *= self.cql_weight
+        cql1_scaled_loss = torch.max(cql1_scaled_loss - 0.1, zero_tensor)
+
         cql2_scaled_loss = \
-            torch.logsumexp(cat_q2 / self.temperature, dim=1).mean() * \
-            self.cql_weight * self.temperature - current_z2.mean() * \
-            self.cql_weight
-        # shape: (1)
+            torch.logsumexp(cat_q2 / self.temperature, dim=1) * \
+                self.temperature - current_z2
+        cql2_scaled_loss = cql2_scaled_loss.mean()
+        cql2_scaled_loss *= self.cql_weight
+        cql2_scaled_loss = torch.max(cql2_scaled_loss - 0.1, zero_tensor)
 
         if self.with_lagrange:
             cql_alpha = torch.clamp(
