@@ -1,11 +1,9 @@
 from typing import Any, Dict, Tuple, Union
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 
-from tianshou.data import to_torch, to_torch_as, Batch
+from tianshou.data import to_torch, Batch
 from tianshou.data.types import RolloutBatchProtocol
 from tianshou.policy import DSACPolicy
 from tianshou.utils.net.continuous import ActorProb
@@ -37,7 +35,7 @@ class CODACPolicy(DSACPolicy):
         alpha_min: float = 0.0,
         alpha_max: float = 1e6,
         clip_grad: float = 1.0,
-        calibrated: bool = False,
+        modified: bool = False,
         device: Union[str, torch.device] = "cpu",
         **kwargs: Any
     ) -> None:
@@ -66,7 +64,12 @@ class CODACPolicy(DSACPolicy):
         self.alpha_max = alpha_max
         self.clip_grad = clip_grad
 
-        self.calibrated = calibrated
+        self.modified = modified
+
+        # const tensors
+        self.random_log_prob = torch.log(torch.tensor(0.5**self.action_space.shape[-1], device=self.device)).repeat(self._n_taus).reshape(1, self._n_taus)
+        self.zero_tensor = torch.tensor([0], device=self.device)
+
 
     def train(self, mode: bool = True) -> "CODACPolicy":
         """Set the module in training mode, except for the target network."""
@@ -113,17 +116,13 @@ class CODACPolicy(DSACPolicy):
     def _calc_random_values(self, obs: torch.Tensor, act: torch.Tensor, taus_hat_j) -> \
             Tuple[torch.Tensor, torch.Tensor]:
         random_value1 = self.critic1(obs, act, taus_hat_j)
-        random_log_prob1 = np.log(0.5**act.shape[-1]).repeat(self._n_taus).reshape(1, self._n_taus)
-        random_log_prob1 = to_torch_as(random_log_prob1, random_value1)
-
         random_value2 = self.critic2(obs, act, taus_hat_j)
-        random_log_prob2 = np.log(0.5**act.shape[-1]).repeat(self._n_taus).reshape(1, self._n_taus)
-        random_log_prob2 = to_torch_as(random_log_prob2, random_value2)
 
-        return random_value1 - random_log_prob1, random_value2 - random_log_prob2
+        return random_value1 - self.random_log_prob, random_value2 - self.random_log_prob
 
     def learn(self, batch: RolloutBatchProtocol, *args: Any,
               **kwargs: Any) -> Dict[str, float]:
+
         batch: RolloutBatchProtocol = to_torch(batch, dtype=torch.float, device=self.device)
         obs, act, rew, obs_next = batch.obs, batch.act, batch.rew, batch.obs_next
         batch_size = len(batch)
@@ -156,7 +155,6 @@ class CODACPolicy(DSACPolicy):
         current_z1, critic1_loss = self._critic_loss(batch, self.critic1, taus_hat_j)
         current_z2, critic2_loss = self._critic_loss(batch, self.critic2, taus_hat_j)
 
-        # CQL
         random_actions = torch.FloatTensor(
             batch_size * self.num_repeat_actions, act.shape[-1]
         ).uniform_(-self.min_action, self.max_action).to(self.device)
@@ -179,20 +177,21 @@ class CODACPolicy(DSACPolicy):
         cat_q2 = torch.cat([random_value2, current_pi_value2], 1)
         # shape: (batch_size, 2 * num_repeat, n_taus)
 
-        zero_tensor = to_torch_as(torch.Tensor([0]), cat_q1)
         cql1_scaled_loss = \
             torch.logsumexp(cat_q1 / self.temperature, dim=1) * \
                 self.temperature - current_z1
         cql1_scaled_loss = cql1_scaled_loss.mean()
         cql1_scaled_loss *= self.cql_weight
-        cql1_scaled_loss = torch.max(cql1_scaled_loss - 0.1, zero_tensor)
 
         cql2_scaled_loss = \
             torch.logsumexp(cat_q2 / self.temperature, dim=1) * \
                 self.temperature - current_z2
         cql2_scaled_loss = cql2_scaled_loss.mean()
         cql2_scaled_loss *= self.cql_weight
-        cql2_scaled_loss = torch.max(cql2_scaled_loss - 0.1, zero_tensor)
+
+        if self.modified:
+            cql1_scaled_loss = torch.max(cql1_scaled_loss + 0.1, self.zero_tensor)
+            cql2_scaled_loss = torch.max(cql2_scaled_loss + 0.1, self.zero_tensor)
 
         if self.with_lagrange:
             cql_alpha = torch.clamp(
