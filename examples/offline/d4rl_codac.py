@@ -26,7 +26,7 @@ def get_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--expert-data-task", type=str, default="hopper-medium-v2")
     parser.add_argument("--buffer-size", type=int, default=1000000)
-    parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256])
+    parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256, 256])
     parser.add_argument("--actor-lr", type=float, default=1e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha", type=float, default=0.2)
@@ -36,15 +36,15 @@ def get_args():
     parser.add_argument("--start-timesteps", type=int, default=10000)
     parser.add_argument("--epoch", type=int, default=200)
     parser.add_argument("--step-per-epoch", type=int, default=5000)
-    parser.add_argument("--n-step", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--n-taus", type=int, default=16)
     parser.add_argument("--risk-type", type=str, default='neutral')
+    parser.add_argument("--modified", default=False, action="store_true")
 
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cql-weight", type=float, default=5.0)
     parser.add_argument("--with-lagrange", type=bool, default=False)
-    parser.add_argument("--calibrated", type=bool, default=True)
     parser.add_argument("--lagrange-threshold", type=float, default=10.0)
     parser.add_argument("--gamma", type=float, default=0.99)
 
@@ -131,6 +131,7 @@ def test_cql():
         critic2_optim=critic2_optim,
         action_space=env.action_space,
         risk_type=args.risk_type,
+        n_taus=args.n_taus,
         cql_alpha_lr=args.cql_alpha_lr,
         cql_weight=args.cql_weight,
         tau=args.tau,
@@ -141,7 +142,7 @@ def test_cql():
         lagrange_threshold=args.lagrange_threshold,
         min_action=np.min(env.action_space.low),
         max_action=np.max(env.action_space.high),
-        calibrated=args.calibrated,
+        modified=args.modified,
         device=args.device,
     )
 
@@ -156,7 +157,7 @@ def test_cql():
     # log
     now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
     args.algo_name = "codac"
-    log_name = os.path.join(args.task, args.algo_name, str(args.seed), now)
+    log_name = os.path.join(args.task, args.algo_name, args.risk_type, str(args.seed), now)
     log_path = os.path.join(args.logdir, log_name)
 
     # logger
