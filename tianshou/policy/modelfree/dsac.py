@@ -23,7 +23,7 @@ class DSACPolicy(SACPolicy):
         critic1_optim: torch.optim.Optimizer,
         critic2: torch.nn.Module,
         critic2_optim: torch.optim.Optimizer,
-        n_taus: int = 32,
+        n_taus: int = 16,
         huber_threshold: float = 1.0,
         risk_type: str = 'neutral', # ['neutral', 'std', 'var', 'wang', 'cvar', 'cpw']
         risk_initial_param: float = 1.,
