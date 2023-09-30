@@ -41,8 +41,8 @@ def get_args():
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cql-weight", type=float, default=5.0)
-    parser.add_argument("--with-lagrange", type=bool, default=False)
-    parser.add_argument("--calibrated", type=bool, default=True)
+    parser.add_argument("--with-lagrange", default=False, action="store_true")
+    parser.add_argument("--calibrated", default=False, action="store_true")
     parser.add_argument("--lagrange-threshold", type=float, default=10.0)
     parser.add_argument("--gamma", type=float, default=0.99)
 
