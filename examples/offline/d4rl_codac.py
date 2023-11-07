@@ -8,27 +8,27 @@ import pprint
 import gymnasium as gym
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 
 from examples.offline.utils import load_buffer_d4rl
 from tianshou.data import Collector
 from tianshou.env import SubprocVectorEnv
 from tianshou.policy import CODACPolicy
-from tianshou.trainer import OfflineTrainer
+from tianshou.trainer import OfflineTrainer, OffpolicyTrainer
 from tianshou.utils import TensorboardLogger, WandbLogger
 from tianshou.utils.net.common import Net
 from tianshou.utils.net.continuous import ActorProb, QuantileMlp
 
-
 def get_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=str, default="offline")
     parser.add_argument("--task", type=str, default="Hopper-v2")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--expert-data-task", type=str, default="hopper-medium-v2")
     parser.add_argument("--buffer-size", type=int, default=1000000)
     parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256, 256])
-    parser.add_argument("--actor-lr", type=float, default=1e-4)
-    parser.add_argument("--critic-lr", type=float, default=3e-4)
+    parser.add_argument("--actor-lr", type=float, default=3e-4)
+    parser.add_argument("--critic-lr", type=float, default=3e-5)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--auto-alpha", default=True, action="store_true")
     parser.add_argument("--alpha-lr", type=float, default=1e-4)
@@ -39,7 +39,11 @@ def get_args():
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-taus", type=int, default=16)
     parser.add_argument("--risk-type", type=str, default='neutral')
-    parser.add_argument("--modified", default=False, action="store_true")
+    parser.add_argument("--calibrated", default=False, action="store_true")
+    parser.add_argument("--train-num", type=int, default=1)
+    parser.add_argument("--exploration", default=False, action="store_true")
+    parser.add_argument("--step-per-collect", type=int, default=1)
+    parser.add_argument("--update-per-step", type=int, default=1)
 
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -56,6 +60,7 @@ def get_args():
     parser.add_argument(
         "--device", type=str, default="cuda:1" if torch.cuda.is_available() else "cpu"
     )
+    parser.add_argument("--behavioral-critic-path", type=str, default="/data/user/R901105/dev/log/Hopper-v4/qr/231102-133240/model.pth")
     parser.add_argument("--resume-path", type=str, default=None)
     parser.add_argument("--resume-id", type=str, default=None)
     parser.add_argument(
@@ -110,11 +115,20 @@ def test_cql():
         conditioned_sigma=True,
     ).to(args.device)
     actor_optim = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
-
-    critic1 = QuantileMlp(hidden_sizes=[256, 256], input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
+    critic1 = QuantileMlp(hidden_sizes=args.hidden_sizes, input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
     critic1_optim = torch.optim.Adam(critic1.parameters(), lr=args.critic_lr)
-    critic2 = QuantileMlp(hidden_sizes=[256, 256], input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
+    critic2 = QuantileMlp(hidden_sizes=args.hidden_sizes, input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
     critic2_optim = torch.optim.Adam(critic2.parameters(), lr=args.critic_lr)
+
+    if args.calibrated:
+        behavioral_critic = QuantileMlp(
+            input_size=args.state_shape[0] + args.action_shape[0],
+            hidden_sizes=[256, 256],
+            device=args.device,
+        ).to(args.device)
+        behavioral_critic.load_state_dict(torch.load(args.behavioral_critic_path, map_location=args.device))
+        print("Loaded behavioral critic from: ", args.behavioral_critic_path)
+
 
     if args.auto_alpha:
         target_entropy = -np.prod(env.action_space.shape)
@@ -142,7 +156,7 @@ def test_cql():
         lagrange_threshold=args.lagrange_threshold,
         min_action=np.min(env.action_space.low),
         max_action=np.max(env.action_space.high),
-        modified=args.modified,
+        behavioral_critic=behavioral_critic if args.calibrated else None,
         device=args.device,
     )
 
@@ -150,13 +164,19 @@ def test_cql():
     if args.resume_path:
         policy.load_state_dict(torch.load(args.resume_path, map_location=args.device))
         print("Loaded agent from: ", args.resume_path)
+        dirname = os.path.dirname(args.resume_path)
+        torch.save(policy.actor.state_dict(), os.path.join(dirname, 'actor.pth'))
+        torch.save(policy.critic1.state_dict(), os.path.join(dirname, 'critic1.pth'))
+        torch.save(policy.critic2.state_dict(), os.path.join(dirname, 'critic2.pth'))
 
     # collector
     test_collector = Collector(policy, test_envs)
 
     # log
     now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
-    args.algo_name = "codac"
+    args.algo_name = "codac_bc" if args.calibrated else "codac"
+    if args.mode == "online":
+        args.algo_name = "online_" + args.algo_name
     log_name = os.path.join(args.task, args.algo_name, args.risk_type, str(args.seed), now)
     log_path = os.path.join(args.logdir, log_name)
 
@@ -192,18 +212,39 @@ def test_cql():
 
     if not args.watch:
         replay_buffer = load_buffer_d4rl(args.expert_data_task)
+        if args.mode == "online":
+            policy.behavioral_critic = None
+            train_envs = SubprocVectorEnv(
+                [lambda: gym.make(args.task) for _ in range(args.train_num)]
+            ) 
+            train_collector = Collector(policy, train_envs, replay_buffer, exploration_noise=args.exploration)
+            result = OffpolicyTrainer(
+                policy=policy,
+                train_collector=train_collector,
+                test_collector=test_collector,
+                max_epoch=args.epoch,
+                step_per_epoch=args.step_per_epoch,
+                step_per_collect=args.step_per_collect,
+                episode_per_test=args.test_num,
+                batch_size=args.batch_size,
+                save_best_fn=save_best_fn,
+                logger=logger,
+                update_per_step=args.update_per_step,
+                test_in_train=False,
+            ).run()
+        else:
         # trainer
-        result = OfflineTrainer(
-            policy=policy,
-            buffer=replay_buffer,
-            test_collector=test_collector,
-            max_epoch=args.epoch,
-            step_per_epoch=args.step_per_epoch,
-            episode_per_test=args.test_num,
-            batch_size=args.batch_size,
-            save_best_fn=save_best_fn,
-            logger=logger,
-        ).run()
+            result = OfflineTrainer(
+                policy=policy,
+                buffer=replay_buffer,
+                test_collector=test_collector,
+                max_epoch=args.epoch,
+                step_per_epoch=args.step_per_epoch,
+                episode_per_test=args.test_num,
+                batch_size=args.batch_size,
+                save_best_fn=save_best_fn,
+                logger=logger,
+            ).run()
         pprint.pprint(result)
     else:
         watch()

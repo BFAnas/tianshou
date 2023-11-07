@@ -1,4 +1,4 @@
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Tuple, Union, Optional
 
 import numpy as np
 import torch
@@ -18,11 +18,11 @@ class DSACPolicy(SACPolicy):
     def __init__(
         self,
         actor: ActorProb,
-        actor_optim: torch.optim.Optimizer,
+        actor_optim: Optional[torch.optim.Optimizer],
         critic1: torch.nn.Module,
-        critic1_optim: torch.optim.Optimizer,
+        critic1_optim: Optional[torch.optim.Optimizer],
         critic2: torch.nn.Module,
-        critic2_optim: torch.optim.Optimizer,
+        critic2_optim: Optional[torch.optim.Optimizer],
         n_taus: int = 16,
         huber_threshold: float = 1.0,
         risk_type: str = 'neutral', # ['neutral', 'std', 'var', 'wang', 'cvar', 'cpw']
@@ -79,14 +79,11 @@ class DSACPolicy(SACPolicy):
 
     @staticmethod
     def _get_taus(batch_size, n_taus, device, dtype):
-        presum_taus = (
-            torch.rand(
-                batch_size,
-                n_taus,
-                dtype=dtype,
-                device=device,
-            )
-            + 0.1
+        presum_taus = torch.rand(
+            batch_size,
+            n_taus,
+            dtype=dtype,
+            device=device,
         )
         presum_taus /= presum_taus.sum(dim=-1, keepdim=True)
         taus = torch.cumsum(presum_taus, dim=1)
@@ -126,7 +123,7 @@ class DSACPolicy(SACPolicy):
     def _normal_pdf(value, loc=0., scale=1.):
         return torch.exp(-(value - loc)**2 / (2 * scale**2)) / scale / np.sqrt(2 * np.pi)    
 
-    def _distortion_de(self, taus, mode="neutral", param=0., eps=1e-8):
+    def _distortion_de(self, taus, mode="neutral", param=0.1, eps=1e-8):
         # Derivative of Risk distortion function
         taus = taus.clamp(0., 1.)
         if param >= 0:

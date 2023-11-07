@@ -7,11 +7,11 @@ import pprint
 
 import numpy as np
 import torch
-from torch import nn
 from mujoco_env import make_mujoco_env
 from torch.utils.tensorboard import SummaryWriter
 
-from tianshou.data import Collector, ReplayBuffer, VectorReplayBuffer
+from examples.offline.utils import load_buffer_d4rl
+from tianshou.data import Collector, ReplayBuffer
 from tianshou.policy import DSACPolicy
 from tianshou.trainer import OffpolicyTrainer
 from tianshou.utils import TensorboardLogger, WandbLogger
@@ -20,19 +20,22 @@ from tianshou.utils.net.continuous import ActorProb, QuantileMlp
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", type=str, default="Hopper-v4")
+    parser.add_argument("--task", type=str, default="Hopper-v2")
+    parser.add_argument("--expert-data-task", type=str, default="hopper-medium-v2")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--risk-type", type=str, default="neutral")
     parser.add_argument("--buffer-size", type=int, default=1000000)
-    parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256])
+    parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256, 256])
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--auto-alpha", default=False, action="store_true")
+    parser.add_argument("--exploration", default=False, action="store_true")
+    parser.add_argument("--offline-buffer", default=False, action="store_true")
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
-    parser.add_argument("--start-timesteps", type=int, default=10000)
+    parser.add_argument("--start-timesteps", type=int, default=1)
     parser.add_argument("--epoch", type=int, default=200)
     parser.add_argument("--step-per-epoch", type=int, default=5000)
     parser.add_argument("--step-per-collect", type=int, default=1)
@@ -91,9 +94,9 @@ def test_sac(args=get_args()):
     ).to(args.device)
     actor_optim = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
 
-    critic1 = QuantileMlp(hidden_sizes=[256, 256], input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
+    critic1 = QuantileMlp(hidden_sizes=args.hidden_sizes, input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
     critic1_optim = torch.optim.Adam(critic1.parameters(), lr=args.critic_lr)
-    critic2 = QuantileMlp(hidden_sizes=[256, 256], input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
+    critic2 = QuantileMlp(hidden_sizes=args.hidden_sizes, input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
     critic2_optim = torch.optim.Adam(critic2.parameters(), lr=args.critic_lr)
 
     if args.auto_alpha:
@@ -120,15 +123,28 @@ def test_sac(args=get_args()):
 
     # load a previous policy
     if args.resume_path:
-        policy.load_state_dict(torch.load(args.resume_path, map_location=args.device))
-        print("Loaded agent from: ", args.resume_path)
+        dirname = os.path.dirname(args.resume_path)
+        if os.path.isfile(os.path.join(dirname, "actor.pth")):
+            policy.actor.load_state_dict(torch.load(os.path.join(dirname, "actor.pth"), map_location=args.device))
+            print("Loaded actor from: ", os.path.join(dirname, "actor.pth"))
+        if os.path.isfile(os.path.join(dirname, "critic1.pth")):
+            policy.critic1.load_state_dict(torch.load(os.path.join(dirname, "critic1.pth"), map_location=args.device))
+            policy.critic1_old.load_state_dict(torch.load(os.path.join(dirname, "critic1.pth"), map_location=args.device))
+            print("Loaded critic1 from: ", os.path.join(dirname, "critic1.pth"))
+        if os.path.isfile(os.path.join(dirname, "critic2.pth")):
+            policy.critic2.load_state_dict(torch.load(os.path.join(dirname, "critic2.pth"), map_location=args.device))
+            policy.critic2_old.load_state_dict(torch.load(os.path.join(dirname, "critic2.pth"), map_location=args.device))
+            print("Loaded critic2 from: ", os.path.join(dirname, "critic2.pth"))
+        else:
+            policy.load_state_dict(torch.load(args.resume_path, map_location=args.device))
+            print("Loaded agent from: ", args.resume_path)
 
     # collector
-    if args.training_num > 1:
-        buffer = VectorReplayBuffer(args.buffer_size, len(train_envs))
+    if args.offline_buffer:
+        buffer = load_buffer_d4rl(args.expert_data_task)
     else:
         buffer = ReplayBuffer(args.buffer_size)
-    train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
+    train_collector = Collector(policy, train_envs, buffer, exploration_noise=args.exploration)
     test_collector = Collector(policy, test_envs)
     train_collector.collect(n_step=args.start_timesteps, random=True)
 
@@ -158,7 +174,6 @@ def test_sac(args=get_args()):
         torch.save(policy.state_dict(), os.path.join(log_path, "policy.pth"))
 
     if not args.watch:
-        # trainer
         result = OffpolicyTrainer(
             policy=policy,
             train_collector=train_collector,
