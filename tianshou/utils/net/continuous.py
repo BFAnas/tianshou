@@ -494,10 +494,8 @@ class QuantileMlp(nn.Module):
         hidden_sizes,
         input_size,
         embedding_size=64,
-        num_quantiles=32,
         layer_norm=True,
         device="cpu",
-        **kwargs,
     ):
         super().__init__()
         self.layer_norm = layer_norm
@@ -515,7 +513,6 @@ class QuantileMlp(nn.Module):
             ]
             last_size = next_size
         self.base_fc = nn.Sequential(*self.base_fc)
-        self.num_quantiles = num_quantiles
         self.embedding_size = embedding_size
         self.tau_fc = nn.Sequential(
             nn.Linear(embedding_size, last_size),
@@ -530,11 +527,25 @@ class QuantileMlp(nn.Module):
         self.last_fc = nn.Linear(hidden_sizes[-1], 1)
         self.const_vec = torch.Tensor(np.arange(1, 1 + self.embedding_size)).to(device)
 
-    def forward(self, state, action, tau):
+    def forward(self, state: torch.Tensor, action: torch.Tensor, tau=None):
         """
         Calculate Quantile Value in Batch
         tau: quantile fractions, (N, T)
         """
+        if tau == None:
+            presum_taus = torch.rand(
+                state.shape[0],
+                16, # TODO fix hardcoded value
+                dtype=state.dtype,
+                device=state.device,
+            )
+            presum_taus /= presum_taus.sum(dim=-1, keepdim=True)
+            taus = torch.cumsum(presum_taus, dim=1)
+            taus_hat = torch.zeros_like(taus).to(state.device)
+            taus_hat[:, 0:1] = taus[:, 0:1] / 2.0
+            taus_hat[:, 1:] = (taus[:, 1:] + taus[:, :-1]) / 2.0
+            tau = taus_hat
+
         h = torch.cat([state, action], dim=1)
         h = self.base_fc(h)  # (N, C)
 

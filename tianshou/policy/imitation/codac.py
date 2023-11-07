@@ -1,4 +1,4 @@
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from torch.nn.utils import clip_grad_norm_
@@ -35,7 +35,7 @@ class CODACPolicy(DSACPolicy):
         alpha_min: float = 0.0,
         alpha_max: float = 1e6,
         clip_grad: float = 1.0,
-        modified: bool = False,
+        behavioral_critic: Optional[torch.nn.Module] = None,
         device: Union[str, torch.device] = "cpu",
         **kwargs: Any
     ) -> None:
@@ -64,7 +64,7 @@ class CODACPolicy(DSACPolicy):
         self.alpha_max = alpha_max
         self.clip_grad = clip_grad
 
-        self.modified = modified
+        self.behavioral_critic = behavioral_critic
 
         # const tensors
         self.random_log_prob = torch.log(torch.tensor(0.5**self.action_space.shape[-1], device=self.device)).repeat(self._n_taus).reshape(1, self._n_taus)
@@ -111,12 +111,22 @@ class CODACPolicy(DSACPolicy):
         z1 = self.critic1(obs_to_pred, act_pred, taus_hat_j)
         z2 = self.critic2(obs_to_pred, act_pred, taus_hat_j)
 
+        if self.behavioral_critic:
+            mc_returns = self.behavioral_critic(obs_to_pred, act_pred, taus_hat_j)
+            z1 = torch.max(z1, mc_returns)
+            z2 = torch.max(z2, mc_returns)
+
         return z1 - log_pi.detach(), z2 - log_pi.detach()
 
     def _calc_random_values(self, obs: torch.Tensor, act: torch.Tensor, taus_hat_j) -> \
             Tuple[torch.Tensor, torch.Tensor]:
         random_value1 = self.critic1(obs, act, taus_hat_j)
         random_value2 = self.critic2(obs, act, taus_hat_j)
+
+        if self.behavioral_critic:
+            mc_returns = self.behavioral_critic(obs, act, taus_hat_j)
+            random_value1 = torch.max(random_value1, mc_returns)
+            random_value2 = torch.max(random_value2, mc_returns)
 
         return random_value1 - self.random_log_prob, random_value2 - self.random_log_prob
 
@@ -188,10 +198,6 @@ class CODACPolicy(DSACPolicy):
                 self.temperature - current_z2
         cql2_scaled_loss = cql2_scaled_loss.mean()
         cql2_scaled_loss *= self.cql_weight
-
-        if self.modified:
-            cql1_scaled_loss = torch.max(cql1_scaled_loss + 0.1, self.zero_tensor)
-            cql2_scaled_loss = torch.max(cql2_scaled_loss + 0.1, self.zero_tensor)
 
         if self.with_lagrange:
             cql_alpha = torch.clamp(
