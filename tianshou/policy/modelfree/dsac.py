@@ -29,6 +29,7 @@ class DSACPolicy(SACPolicy):
         risk_initial_param: float = 1.,
         risk_final_param: float = 0.,
         risk_schedule_timesteps: int = 1e6,
+        distortion_param: float = 0.1,
         tau: float = 0.005,
         gamma: float = 0.99,
         alpha: Union[float, Tuple[float, torch.Tensor, torch.optim.Optimizer]] = 0.2,
@@ -58,6 +59,7 @@ class DSACPolicy(SACPolicy):
         self._risk_final_param = risk_final_param
         self._risk_schedule_timesteps = risk_schedule_timesteps
         self._train_step = 0
+        self._distortion_param = distortion_param
 
     # TODO implement compute_n_return
     def train(self, mode: bool = True) -> "DSACPolicy":
@@ -74,22 +76,21 @@ class DSACPolicy(SACPolicy):
 
     def _update_risk_param(self) -> None:
         self._risk_schedule_timesteps += 1
-        fraction = min(float(self._train_step) / self._risk_schedule_timesteps, 1.0)
+        fraction = min(float(self._train_step) / self._risk_schedule_timesteps, 1.)
         self._risk_param = self._risk_initial_param + fraction * (self._risk_final_param - self._risk_initial_param)
 
-    @staticmethod
-    def _get_taus(batch_size, n_taus, device, dtype):
+    def _get_taus(self, batch_size, n_taus, dtype):
         presum_taus = torch.rand(
             batch_size,
             n_taus,
             dtype=dtype,
-            device=device,
-        )
+            device=self.device,
+        ) + 0.1
         presum_taus /= presum_taus.sum(dim=-1, keepdim=True)
         taus = torch.cumsum(presum_taus, dim=1)
-        taus_hat = torch.zeros_like(taus).to(device)
-        taus_hat[:, 0:1] = taus[:, 0:1] / 2.0
-        taus_hat[:, 1:] = (taus[:, 1:] + taus[:, :-1]) / 2.0
+        taus_hat = torch.zeros_like(taus, device=self.device)
+        taus_hat[:, 0:1] = taus[:, 0:1] / 2.
+        taus_hat[:, 1:] = (taus[:, 1:] + taus[:, :-1]) / 2.
         return taus_hat, presum_taus
 
     @staticmethod
@@ -123,8 +124,9 @@ class DSACPolicy(SACPolicy):
     def _normal_pdf(value, loc=0., scale=1.):
         return torch.exp(-(value - loc)**2 / (2 * scale**2)) / scale / np.sqrt(2 * np.pi)    
 
-    def _distortion_de(self, taus, mode="neutral", param=0.1, eps=1e-8):
+    def _distortion_de(self, taus, mode="neutral", param_coef=1, eps=1e-8):
         # Derivative of Risk distortion function
+        param = self._distortion_param * param_coef
         taus = taus.clamp(0., 1.)
         if param >= 0:
             if mode == "neutral":
@@ -144,37 +146,33 @@ class DSACPolicy(SACPolicy):
             return taus_.clamp(0., 5.).to(taus.device)
 
         else:
-            return self._distortion_de(1 - taus, mode, -param)
+            return self._distortion_de(1 - taus, mode, -1)
 
     def _target_z(self, batch: RolloutBatchProtocol) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = len(batch)
         obs_next_result = self(batch, input="obs_next")
         act_ = obs_next_result.act
         taus_hat, presum_taus = self._get_taus(
-            batch_size, self._n_taus, batch.obs.device, batch.obs.dtype
+            batch_size, self._n_taus, batch.obs.dtype
         )
         next_z1 = self.critic1_old(batch.obs_next, act_, taus_hat)  # (bsz, n_taus)
         next_z2 = self.critic2_old(batch.obs_next, act_, taus_hat)
         log_prob = obs_next_result.log_prob.repeat((1, self._n_taus))
         target_z = (
             batch.rew.unsqueeze(-1).repeat(1, self._n_taus)
-            + (1.0 - batch.done.unsqueeze(-1).repeat(1, self._n_taus))
+            + (1. - batch.done.unsqueeze(-1).repeat(1, self._n_taus))
             * self._gamma
-            * torch.min(
+            * (torch.min(
                 next_z1,
                 next_z2,
             )
-            - self._alpha * log_prob
+            - self._alpha * log_prob)
         )
         return target_z, presum_taus
 
     def _critic_loss(
-        self, batch: RolloutBatchProtocol, critic: torch.nn.Module
+        self, batch: RolloutBatchProtocol, critic: torch.nn.Module, taus_hat_j: torch.Tensor
         ) -> torch.Tensor:
-        batch_size = len(batch)
-        taus_hat_j, _ = self._get_taus(
-            batch_size, self._n_taus, batch.obs.device, batch.obs.dtype
-        )
         current_z = critic(batch.obs, batch.act, taus_hat_j)
         with torch.no_grad():
             target_z, presum_taus_i = self._target_z(batch)
@@ -189,12 +187,12 @@ class DSACPolicy(SACPolicy):
     ) -> (torch.Tensor, torch.Tensor):
         # get Q for risk type
         if self._risk_type == 'var':
-            taus = torch.ones_like(batch.rew, device=batch.rew.device) * self._risk_param
+            taus = torch.ones_like(batch.rew, device=self.device) * self._risk_param
             q1a = self.critic1(batch.obs, act, taus)
             q2a = self.critic2(batch.obs, act, taus)
         else:
             taus_hat, presum_taus = self._get_taus(
-                len(batch), self._n_taus, batch.obs.device, batch.obs.dtype
+                len(batch), self._n_taus, batch.obs.dtype
             )
             z1a = self.critic1(batch.obs, act, taus_hat)
             z2a = self.critic2(batch.obs, act, taus_hat)
@@ -216,8 +214,11 @@ class DSACPolicy(SACPolicy):
     def learn(self, batch: RolloutBatchProtocol, **kwargs: Any) -> Dict[str, float]:
         batch: RolloutBatchProtocol = to_torch(batch, dtype=torch.float, device=self.device)
         # critic 1&2
-        critic1_loss = self._critic_loss(batch, self.critic1)
-        critic2_loss = self._critic_loss(batch, self.critic2)
+        taus_hat_j, _ = self._get_taus(
+            len(batch), self._n_taus, batch.obs.dtype
+        )
+        critic1_loss = self._critic_loss(batch, self.critic1, taus_hat_j)
+        critic2_loss = self._critic_loss(batch, self.critic2, taus_hat_j)
         self.critic1_optim.zero_grad()
         critic1_loss.backward()
         self.critic1_optim.step()
