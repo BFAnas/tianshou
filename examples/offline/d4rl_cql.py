@@ -8,6 +8,7 @@ import pprint
 import gymnasium as gym
 import numpy as np
 import torch
+from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
 from examples.offline.utils import load_buffer_d4rl
@@ -37,6 +38,7 @@ def get_args():
     parser.add_argument("--epoch", type=int, default=200)
     parser.add_argument("--step-per-epoch", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--norm-layer", default=True, action=argparse.BooleanOptionalAction)
 
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -133,18 +135,13 @@ def test_cql():
 
     # model
     # actor network
-    net_a = Net(
-        args.state_shape,
-        args.action_shape,
-        hidden_sizes=args.hidden_sizes,
-        device=args.device,
-    )
+    net_a = Net(args.state_shape, hidden_sizes=args.hidden_sizes, device=args.device)
     actor = ActorProb(
         net_a,
-        action_shape=args.action_shape,
+        args.action_shape,
         device=args.device,
         unbounded=True,
-        conditioned_sigma=True
+        conditioned_sigma=True,
     ).to(args.device)
     actor_optim = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
 
@@ -155,6 +152,7 @@ def test_cql():
         hidden_sizes=args.hidden_sizes,
         concat=True,
         device=args.device,
+        norm_layer=nn.LayerNorm if args.norm_layer else None
     )
     net_c2 = Net(
         args.state_shape,
@@ -162,6 +160,7 @@ def test_cql():
         hidden_sizes=args.hidden_sizes,
         concat=True,
         device=args.device,
+        norm_layer=nn.LayerNorm if args.norm_layer else None
     )
     critic1 = Critic(net_c1, device=args.device).to(args.device)
     critic1_optim = torch.optim.Adam(critic1.parameters(), lr=args.critic_lr)
@@ -243,7 +242,7 @@ def test_cql():
     if not args.watch:
         replay_buffer = load_buffer_d4rl(args.expert_data_task)
         if args.calibrated:
-            replay_buffer = add_returns(replay_buffer)
+            replay_buffer = add_returns(replay_buffer, args.gamma)
         # trainer
         result = OfflineTrainer(
             policy=policy,

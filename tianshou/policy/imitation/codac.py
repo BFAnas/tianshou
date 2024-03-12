@@ -70,6 +70,7 @@ class CODACPolicy(DSACPolicy):
         self.random_log_prob = torch.log(torch.tensor(0.5**self.action_space.shape[-1], device=self.device)).repeat(self._n_taus).reshape(1, self._n_taus)
         self.zero_tensor = torch.tensor([0], device=self.device)
 
+        self.shape = (-1, self.num_repeat_actions, self._n_taus)
 
     def train(self, mode: bool = True) -> "CODACPolicy":
         """Set the module in training mode, except for the target network."""
@@ -111,24 +112,14 @@ class CODACPolicy(DSACPolicy):
         z1 = self.critic1(obs_to_pred, act_pred, taus_hat_j)
         z2 = self.critic2(obs_to_pred, act_pred, taus_hat_j)
 
-        if self.behavioral_critic:
-            mc_returns = self.behavioral_critic(obs_to_pred, act_pred, taus_hat_j)
-            z1 = torch.max(z1, mc_returns)
-            z2 = torch.max(z2, mc_returns)
-
-        return z1 - log_pi.detach(), z2 - log_pi.detach()
+        return (z1 - log_pi.detach()).reshape(self.shape), (z2 - log_pi.detach()).reshape(self.shape)
 
     def _calc_random_values(self, obs: torch.Tensor, act: torch.Tensor, taus_hat_j) -> \
             Tuple[torch.Tensor, torch.Tensor]:
         random_value1 = self.critic1(obs, act, taus_hat_j)
         random_value2 = self.critic2(obs, act, taus_hat_j)
 
-        if self.behavioral_critic:
-            mc_returns = self.behavioral_critic(obs, act, taus_hat_j)
-            random_value1 = torch.max(random_value1, mc_returns)
-            random_value2 = torch.max(random_value2, mc_returns)
-
-        return random_value1 - self.random_log_prob, random_value2 - self.random_log_prob
+        return (random_value1 - self.random_log_prob).reshape(self.shape), (random_value2 - self.random_log_prob).reshape(self.shape)
 
     def learn(self, batch: RolloutBatchProtocol, *args: Any,
               **kwargs: Any) -> Dict[str, float]:
@@ -137,7 +128,7 @@ class CODACPolicy(DSACPolicy):
         obs, act, rew, obs_next = batch.obs, batch.act, batch.rew, batch.obs_next
         batch_size = len(batch)
         taus_hat_j, _ = self._get_taus(
-            batch_size, self._n_taus, batch.obs.device, batch.obs.dtype
+            batch_size, self._n_taus, batch.obs.dtype
         )
 
         # compute actor loss and update actor
@@ -162,42 +153,50 @@ class CODACPolicy(DSACPolicy):
             self._alpha = self._log_alpha.detach().exp()
 
         # compute critics loss
-        current_z1, critic1_loss = self._critic_loss(batch, self.critic1, taus_hat_j)
-        current_z2, critic2_loss = self._critic_loss(batch, self.critic2, taus_hat_j)
+        current_z1, _critic1_loss = self._critic_loss(batch, self.critic1, taus_hat_j)
+        current_z2, _critic2_loss = self._critic_loss(batch, self.critic2, taus_hat_j)
+
+        mean_current_z_value = 0.5 * (current_z1.mean() + current_z2.mean())
 
         random_actions = torch.FloatTensor(
             batch_size * self.num_repeat_actions, act.shape[-1]
-        ).uniform_(-self.min_action, self.max_action).to(self.device)
+        ).uniform_(self.min_action, self.max_action).to(self.device)
 
         tmp_obs = self.repeat_tensor(obs)
-        taus_hat_j = self.repeat_tensor(taus_hat_j)
+        tmp_obs_next = self.repeat_tensor(obs_next)
+        tmp_taus_hat_j = self.repeat_tensor(taus_hat_j)
         # tmp_obs: (batch_size * num_repeat, state_dim)
-        # taus_hat_j: (batch_size * num_repeat, n_taus)
+        # tmp_taus_hat_j: (batch_size * num_repeat, n_taus)
 
-        current_pi_value1, current_pi_value2 = self._calc_pi_values(tmp_obs, tmp_obs, taus_hat_j)
-        random_value1, random_value2 = self._calc_random_values(tmp_obs, random_actions, taus_hat_j)
+        current_pi_value1, current_pi_value2 = self._calc_pi_values(tmp_obs, tmp_obs, tmp_taus_hat_j)
+        next_pi_value1, next_pi_value2 = self._calc_pi_values(tmp_obs_next, tmp_obs, tmp_taus_hat_j)
+        random_value1, random_value2 = self._calc_random_values(tmp_obs, random_actions, tmp_taus_hat_j)
 
-        current_pi_value1 = current_pi_value1.reshape(batch_size, self.num_repeat_actions, self._n_taus)
-        current_pi_value2 = current_pi_value2.reshape(batch_size, self.num_repeat_actions, self._n_taus)
-        random_value1 = random_value1.reshape(batch_size, self.num_repeat_actions, self._n_taus)
-        random_value2 = random_value2.reshape(batch_size, self.num_repeat_actions, self._n_taus)
+        mean_random_value = 0.5 * (random_value1.mean() + random_value2.mean())
+        mean_current_pi_value = 0.5 * (current_pi_value1.mean() + current_pi_value2.mean())
+
+        if self.behavioral_critic:
+            with torch.no_grad():
+                bc_value = self.behavioral_critic(obs, act, taus_hat_j)
+            mc_returns = self.repeat_tensor(bc_value).reshape(self.shape)
+            current_pi_value1, current_pi_value2 = torch.max(current_pi_value1, mc_returns), torch.max(current_pi_value2, mc_returns)
+            next_pi_value1, next_pi_value2 = torch.max(next_pi_value1, mc_returns), torch.max(next_pi_value2, mc_returns)
+            random_value1, random_value2 = torch.max(random_value1, mc_returns), torch.max(random_value2, mc_returns)            
 
         # cat q values
-        cat_q1 = torch.cat([random_value1, current_pi_value1], 1)
-        cat_q2 = torch.cat([random_value2, current_pi_value2], 1)
-        # shape: (batch_size, 2 * num_repeat, n_taus)
+        cat_q1 = torch.cat([random_value1, current_pi_value1, next_pi_value1], 1)
+        cat_q2 = torch.cat([random_value2, current_pi_value2, next_pi_value2], 1)
+        # shape: (batch_size, 3 * num_repeat, n_taus)
 
         cql1_scaled_loss = \
-            torch.logsumexp(cat_q1 / self.temperature, dim=1) * \
-                self.temperature - current_z1
-        cql1_scaled_loss = cql1_scaled_loss.mean()
-        cql1_scaled_loss *= self.cql_weight
-
+            torch.logsumexp(cat_q1 / self.temperature, dim=1).mean() * \
+            self.cql_weight * self.temperature - current_z1.mean() * \
+            self.cql_weight
         cql2_scaled_loss = \
-            torch.logsumexp(cat_q2 / self.temperature, dim=1) * \
-                self.temperature - current_z2
-        cql2_scaled_loss = cql2_scaled_loss.mean()
-        cql2_scaled_loss *= self.cql_weight
+            torch.logsumexp(cat_q2 / self.temperature, dim=1).mean() * \
+            self.cql_weight * self.temperature - current_z2.mean() * \
+            self.cql_weight
+        # shape: (1)
 
         if self.with_lagrange:
             cql_alpha = torch.clamp(
@@ -215,8 +214,8 @@ class CODACPolicy(DSACPolicy):
             cql_alpha_loss.backward(retain_graph=True)
             self.cql_alpha_optim.step()
 
-        critic1_loss = critic1_loss + cql1_scaled_loss
-        critic2_loss = critic2_loss + cql2_scaled_loss
+        critic1_loss = _critic1_loss + cql1_scaled_loss
+        critic2_loss = _critic2_loss + cql2_scaled_loss
 
         # update critic
         self.critic1_optim.zero_grad()
@@ -235,8 +234,13 @@ class CODACPolicy(DSACPolicy):
 
         result = {
             "loss/actor": actor_loss.item(),
-            "loss/critic1": critic1_loss.item(),
-            "loss/critic2": critic2_loss.item(),
+            "loss/critic1": _critic1_loss.item(),
+            "loss/critic2": _critic2_loss.item(),
+            "loss/cql1": cql1_scaled_loss.item(),
+            "loss/cql2": cql2_scaled_loss.item(),
+            "q_dataset": mean_current_z_value.item(),
+            "q_random": mean_random_value.detach(),
+            "q_current": mean_current_pi_value.detach(),
         }
         if self._is_auto_alpha:
             result["loss/alpha"] = alpha_loss.item()
