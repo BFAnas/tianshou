@@ -6,12 +6,13 @@ import os
 import pprint
 
 import numpy as np
+from tianshou.data.buffer.vecbuf import VectorReplayBuffer
 import torch
 from mujoco_env import make_mujoco_env
 from torch.utils.tensorboard import SummaryWriter
 
 from examples.offline.utils import load_buffer_d4rl
-from tianshou.data import Collector, ReplayBuffer
+from tianshou.data import Collector
 from tianshou.policy import DSACPolicy
 from tianshou.trainer import OffpolicyTrainer
 from tianshou.utils import TensorboardLogger, WandbLogger
@@ -32,10 +33,10 @@ def get_args():
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--auto-alpha", default=False, action="store_true")
-    parser.add_argument("--exploration", default=False, action="store_true")
+    parser.add_argument("--exploration", default=True, action="store_true")
     parser.add_argument("--offline-buffer", default=False, action="store_true")
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
-    parser.add_argument("--start-timesteps", type=int, default=1)
+    parser.add_argument("--start-timesteps", type=int, default=10000)
     parser.add_argument("--epoch", type=int, default=200)
     parser.add_argument("--step-per-epoch", type=int, default=5000)
     parser.add_argument("--step-per-collect", type=int, default=1)
@@ -143,9 +144,10 @@ def test_sac(args=get_args()):
     if args.offline_buffer:
         buffer = load_buffer_d4rl(args.expert_data_task)
     else:
-        buffer = ReplayBuffer(args.buffer_size)
+        buffer = VectorReplayBuffer(args.buffer_size, args.training_num)
     train_collector = Collector(policy, train_envs, buffer, exploration_noise=args.exploration)
-    test_collector = Collector(policy, test_envs)
+    test_buffer = VectorReplayBuffer(1000*args.test_num, args.test_num)
+    test_collector = Collector(policy, test_envs, test_buffer)
     train_collector.collect(n_step=args.start_timesteps, random=True)
 
     # log

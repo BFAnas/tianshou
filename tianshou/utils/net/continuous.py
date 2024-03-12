@@ -498,6 +498,7 @@ class QuantileMlp(nn.Module):
         device="cpu",
     ):
         super().__init__()
+        self.device = device
         self.layer_norm = layer_norm
         # hidden_sizes[:-2] MLP base
         # hidden_sizes[-2] before merge
@@ -537,11 +538,11 @@ class QuantileMlp(nn.Module):
                 state.shape[0],
                 16, # TODO fix hardcoded value
                 dtype=state.dtype,
-                device=state.device,
+                device=self.device,
             )
             presum_taus /= presum_taus.sum(dim=-1, keepdim=True)
             taus = torch.cumsum(presum_taus, dim=1)
-            taus_hat = torch.zeros_like(taus).to(state.device)
+            taus_hat = torch.zeros_like(taus).to(self.device)
             taus_hat[:, 0:1] = taus[:, 0:1] / 2.0
             taus_hat[:, 1:] = (taus[:, 1:] + taus[:, :-1]) / 2.0
             tau = taus_hat

@@ -7,6 +7,7 @@ import pprint
 
 import numpy as np
 import torch
+from torch import nn
 from mujoco_env import make_mujoco_env
 from torch.utils.tensorboard import SummaryWriter
 
@@ -36,6 +37,7 @@ def get_args():
     parser.add_argument("--step-per-epoch", type=int, default=5000)
     parser.add_argument("--step-per-collect", type=int, default=1)
     parser.add_argument("--update-per-step", type=int, default=1)
+    parser.add_argument("--norm-layer", default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--n-step", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--training-num", type=int, default=1)
@@ -92,6 +94,7 @@ def test_sac(args=get_args()):
         hidden_sizes=args.hidden_sizes,
         concat=True,
         device=args.device,
+        norm_layer=nn.LayerNorm if args.norm_layer else None
     )
     net_c2 = Net(
         args.state_shape,
@@ -99,6 +102,7 @@ def test_sac(args=get_args()):
         hidden_sizes=args.hidden_sizes,
         concat=True,
         device=args.device,
+        norm_layer=nn.LayerNorm if args.norm_layer else None
     )
     critic1 = Critic(net_c1, device=args.device).to(args.device)
     critic1_optim = torch.optim.Adam(critic1.parameters(), lr=args.critic_lr)
@@ -164,6 +168,12 @@ def test_sac(args=get_args()):
     def save_best_fn(policy):
         torch.save(policy.state_dict(), os.path.join(log_path, "policy.pth"))
 
+    def save_checkpoint_fn(epoch: int,
+        env_step: int, gradient_step: int) -> str:
+        if epoch % 10 == 0:
+            torch.save(policy.state_dict(), os.path.join(log_path, f"policy_{epoch}.pth"))
+        return f"Saved policy_{epoch}.pth"
+
     if not args.watch:
         # trainer
         result = OffpolicyTrainer(
@@ -176,6 +186,7 @@ def test_sac(args=get_args()):
             episode_per_test=args.test_num,
             batch_size=args.batch_size,
             save_best_fn=save_best_fn,
+            save_checkpoint_fn=save_checkpoint_fn,
             logger=logger,
             update_per_step=args.update_per_step,
             test_in_train=False,

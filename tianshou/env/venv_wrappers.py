@@ -119,3 +119,36 @@ class VectorEnvNormObs(VectorEnvWrapper):
     def get_obs_rms(self) -> RunningMeanStd:
         """Return observation running mean/std."""
         return self.obs_rms
+
+
+class MyVectorEnvNormObs(VectorEnvWrapper):
+    """An observation normalization wrapper for vectorized environments.
+    Based on observation space highs and lows"""
+
+    def __init__(self, venv: BaseVectorEnv) -> None:
+        super().__init__(venv)
+
+    def reset(
+        self,
+        id: Optional[Union[int, List[int], np.ndarray]] = None,
+        init_state = None,
+        **kwargs: Any
+    ) -> Tuple[np.ndarray, Union[dict, List[dict]]]:
+        obs, info = self.venv.reset(id, init_state=init_state, **kwargs)
+        return self._normalize_obs(obs), info
+
+    def step(
+        self,
+        action: np.ndarray,
+        id: Optional[Union[int, List[int], np.ndarray]] = None
+    ) -> gym_new_venv_step_type:
+        step_results = self.venv.step(action, id)
+        return (self._normalize_obs(step_results[0]), *step_results[1:])
+
+    def _normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        observation_space = self.venv.get_env_attr("observation_space")[0]
+        return (obs - observation_space.low) / (observation_space.high - observation_space.low)
+    
+    def denormalize_obs(self, norm_obs: np.ndarray) -> np.ndarray:
+        observation_space = self.venv.get_env_attr("observation_space")[0]
+        return norm_obs * (observation_space.high - observation_space.low) + observation_space.low

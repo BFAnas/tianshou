@@ -109,6 +109,7 @@ class CQLPolicy(SACPolicy):
         self.clip_grad = clip_grad
 
         self.calibrated = calibrated
+        self.shape = (-1, self.num_repeat_actions, 1)
 
     def train(self, mode: bool = True) -> "CQLPolicy":
         """Set the module in training mode, except for the target network."""
@@ -210,13 +211,15 @@ class CQLPolicy(SACPolicy):
         current_Q2 = self.critic2(obs, act).flatten()
         # shape: (batch_size)
 
-        critic1_loss = F.mse_loss(current_Q1, target_Q)
-        critic2_loss = F.mse_loss(current_Q2, target_Q)
+        mean_current_Q = 0.5 * (current_Q1.mean() + current_Q2.mean())
+
+        _critic1_loss = F.mse_loss(current_Q1, target_Q)
+        _critic2_loss = F.mse_loss(current_Q2, target_Q)
 
         # CQL
         random_actions = torch.FloatTensor(
             batch_size * self.num_repeat_actions, act.shape[-1]
-        ).uniform_(-self.min_action, self.max_action).to(self.device)
+        ).uniform_(self.min_action, self.max_action).to(self.device)
 
         obs_len = len(obs.shape)
         repeat_size = [1, self.num_repeat_actions] + [1] * (obs_len - 1)
@@ -227,14 +230,10 @@ class CQLPolicy(SACPolicy):
 
         current_pi_value1, current_pi_value2 = self.calc_pi_values(tmp_obs, tmp_obs)
         next_pi_value1, next_pi_value2 = self.calc_pi_values(tmp_obs_next, tmp_obs)
-
         random_value1, random_value2 = self.calc_random_values(tmp_obs, random_actions)
 
-        for value in [
-            current_pi_value1, current_pi_value2, next_pi_value1, next_pi_value2,
-            random_value1, random_value2
-        ]:
-            value.reshape(batch_size, self.num_repeat_actions, 1)
+        mean_random_value = 0.5 * (random_value1.mean() + random_value2.mean())
+        mean_current_pi_value = 0.5 * (current_pi_value1.mean() + current_pi_value2.mean())
 
         if self.calibrated:
             returns = batch.calibration_returns.unsqueeze(1).repeat(
@@ -250,8 +249,8 @@ class CQLPolicy(SACPolicy):
             next_pi_value2 = torch.max(next_pi_value2, returns)
 
         # cat q values
-        cat_q1 = torch.cat([random_value1, current_pi_value1, next_pi_value1], 1)
-        cat_q2 = torch.cat([random_value2, current_pi_value2, next_pi_value2], 1)
+        cat_q1 = torch.cat([random_value1.reshape(self.shape), current_pi_value1.reshape(self.shape), next_pi_value1.reshape(self.shape)], 1)
+        cat_q2 = torch.cat([random_value2.reshape(self.shape), current_pi_value2.reshape(self.shape), next_pi_value2.reshape(self.shape)], 1)
         # shape: (batch_size, 3 * num_repeat, 1)
 
         cql1_scaled_loss = \
@@ -280,8 +279,8 @@ class CQLPolicy(SACPolicy):
             cql_alpha_loss.backward(retain_graph=True)
             self.cql_alpha_optim.step()
 
-        critic1_loss = critic1_loss + cql1_scaled_loss
-        critic2_loss = critic2_loss + cql2_scaled_loss
+        critic1_loss = _critic1_loss + cql1_scaled_loss
+        critic2_loss = _critic2_loss + cql2_scaled_loss
 
         # update critic
         self.critic1_optim.zero_grad()
@@ -300,8 +299,13 @@ class CQLPolicy(SACPolicy):
 
         result = {
             "loss/actor": actor_loss.item(),
-            "loss/critic1": critic1_loss.item(),
-            "loss/critic2": critic2_loss.item(),
+            "loss/critic1": _critic1_loss.item(),
+            "loss/critic2": _critic2_loss.item(),
+            "loss/cql1": cql1_scaled_loss.item(),
+            "loss/cql2": cql2_scaled_loss.item(),
+            "q_dataset": mean_current_Q.item(),
+            "q_random": mean_random_value.detach(),
+            "q_current": mean_current_pi_value.detach(),
         }
         if self._is_auto_alpha:
             result["loss/alpha"] = alpha_loss.item()
