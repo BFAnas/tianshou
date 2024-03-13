@@ -7,6 +7,7 @@ import pprint
 
 import numpy as np
 from tianshou.data.batch import Batch
+from tianshou.data.buffer.base import ReplayBuffer
 from tianshou.data.buffer.vecbuf import VectorReplayBuffer
 from tianshou.env.venv_wrappers import MyVectorEnvNormObs
 from tianshou.env.venvs import DummyVectorEnv, ShmemVectorEnv
@@ -16,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from env.dompc_poly_env import DoMPC_Poly_env
 from tianshou.data import Collector
 from tianshou.policy import CODACPolicy
-from tianshou.trainer import OffpolicyTrainer
+from tianshou.trainer import OfflineTrainer
 from tianshou.utils import TensorboardLogger, WandbLogger
 from tianshou.utils.net.common import Net
 from tianshou.utils.net.continuous import ActorProb, QuantileMlp
@@ -24,6 +25,7 @@ from tianshou.utils.net.continuous import ActorProb, QuantileMlp
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="DoMPC")
+    parser.add_argument("--expert-data-path", type=str, default="/data/user/R901105/dev/log/DoMPC/dsac/neutral/0/240311-152608/buffer.hdf5")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--risk-type", type=str, default="neutral")
     parser.add_argument("--buffer-size", type=int, default=1000000)
@@ -39,10 +41,7 @@ def get_args():
     parser.add_argument("--step-per-epoch", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-taus", type=int, default=16)
-    parser.add_argument("--risk-type", type=str, default='neutral')
     parser.add_argument("--calibrated", default=False, action="store_true")
-    parser.add_argument("--train-num", type=int, default=1)
-    parser.add_argument("--exploration", default=False, action="store_true")
     parser.add_argument("--step-per-collect", type=int, default=1)
     parser.add_argument("--update-per-step", type=int, default=1)
 
@@ -54,8 +53,6 @@ def get_args():
     parser.add_argument("--gamma", type=float, default=0.99)
 
     parser.add_argument("--n-step", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--training-num", type=int, default=1)
     parser.add_argument("--test-num", type=int, default=10)
     parser.add_argument("--logdir", type=str, default="log")
     parser.add_argument("--penalties", type=int, nargs="*", default=[])
@@ -68,7 +65,6 @@ def get_args():
     parser.add_argument("--behavioral-critic-path", type=str, default="/data/user/R901105/dev/log/DoMPC/qr/240312-151726/model.pth")
     parser.add_argument("--resume-path", type=str, default=None)
     parser.add_argument("--gpu-to-use", type=int, default=0)
-    parser.add_argument("--resume-path", type=str, default=None)
     parser.add_argument("--resume-id", type=str, default=None)
     parser.add_argument(
         "--logger",
@@ -86,11 +82,10 @@ def get_args():
     return parser.parse_args()
 
 
-def test_sac(args=get_args()):
+def test_codac(args=get_args()):
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu_to_use)
     env = DoMPC_Poly_env(render=args.render, randomize=args.randomize, hard_constraint=args.hard_constraint, penalties=args.penalties)
-    train_envs = MyVectorEnvNormObs(ShmemVectorEnv([lambda: DoMPC_Poly_env(render=args.render, randomize=args.randomize, hard_constraint=args.hard_constraint, penalties=args.penalties) for _ in range(args.training_num)]))
     test_envs = MyVectorEnvNormObs(ShmemVectorEnv([lambda: DoMPC_Poly_env(render=args.render, randomize=args.randomize, hard_constraint=args.hard_constraint, penalties=args.penalties) for _ in range(args.test_num)]))
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
@@ -162,12 +157,8 @@ def test_sac(args=get_args()):
         print("Loaded agent from: ", args.resume_path)
 
     # collector
-    buffer = VectorReplayBuffer(args.buffer_size, args.training_num)
-    train_collector = Collector(policy, train_envs, buffer, exploration_noise=args.exploration)
     test_buffer = VectorReplayBuffer(1000*args.test_num, args.test_num)
     test_collector = Collector(policy, test_envs, test_buffer)
-
-    train_collector.collect(n_step=args.start_timesteps, random=True)
 
     # log
     now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
@@ -213,33 +204,23 @@ def test_sac(args=get_args()):
         fig = venv.venv.get_env_attr("fig")[0]
         fig.savefig(os.path.join(log_path, "best_policy.png"))
 
-    def test_fn(num_epoch: int, step_idx: int):
-        if num_epoch > 50:
-            return
-        if num_epoch % 10 == 0:
-            torch.save(policy.state_dict(), os.path.join(log_path, f"policy_{num_epoch}.pth"))
-
+    replay_buffer = ReplayBuffer(1000000)
+    replay_buffer = replay_buffer.load_hdf5(args.expert_data_path)
+    replay_buffer = replay_buffer.from_data(replay_buffer.obs, replay_buffer.act, replay_buffer.rew, replay_buffer.terminated, replay_buffer.truncated, replay_buffer.done, replay_buffer.obs_next)
 
     if not args.watch:
-        result = OffpolicyTrainer(
+        result = OfflineTrainer(
             policy=policy,
-            train_collector=train_collector,
+            buffer=replay_buffer,
             test_collector=test_collector,
             max_epoch=args.epoch,
             step_per_epoch=args.step_per_epoch,
-            step_per_collect=args.step_per_collect,
             episode_per_test=args.test_num,
             batch_size=args.batch_size,
             save_best_fn=save_best_fn,
-            test_fn=test_fn,
             logger=logger,
-            update_per_step=args.update_per_step,
-            test_in_train=False,
         ).run()
         pprint.pprint(result)
-
-    # Save buffer
-    buffer.save_hdf5(os.path.join(log_path, "buffer.hdf5"))
     
     # Let's watch its performance!
     policy.eval()
@@ -250,4 +231,4 @@ def test_sac(args=get_args()):
 
 
 if __name__ == "__main__":
-    test_sac()
+    test_codac()
