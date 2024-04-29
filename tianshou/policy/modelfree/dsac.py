@@ -184,7 +184,7 @@ class DSACPolicy(SACPolicy):
     
     def _q_risk(
         self, batch: RolloutBatchProtocol, act: torch.Tensor
-    ) -> (torch.Tensor, torch.Tensor):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # get Q for risk type
         if self._risk_type == 'var':
             taus = torch.ones_like(batch.rew, device=self.device) * self._risk_param

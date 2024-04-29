@@ -27,6 +27,8 @@ from tianshou.utils import TensorboardLogger
 from tianshou.utils.net.common import Net
 from tianshou.utils.net.continuous import ActorProb, QuantileMlp
 
+plt.rcParams['font.size'] = 16
+
 class MixedPolicy(BasePolicy):
     def __init__(self, 
                  base_policy: BasePolicy, 

@@ -47,7 +47,7 @@ def get_args():
 
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--cql-weight", type=float, default=5.0)
+    parser.add_argument("--cql-weight", type=float, default=1.0)
     parser.add_argument("--with-lagrange", default=False, action="store_true")
     parser.add_argument("--lagrange-threshold", type=float, default=10.0)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -155,6 +155,12 @@ def test_codac(args=get_args()):
     if args.resume_path:
         policy.load_state_dict(torch.load(args.resume_path, map_location=args.device))
         print("Loaded agent from: ", args.resume_path)
+        dirname = os.path.dirname(args.resume_path)
+        torch.save(policy.actor.state_dict(), os.path.join(dirname, 'actor.pth'))
+        torch.save(policy.critic1.state_dict(), os.path.join(dirname, 'critic1.pth'))
+        torch.save(policy.critic2.state_dict(), os.path.join(dirname, 'critic2.pth'))
+        # stop here
+        return
 
     # collector
     test_buffer = VectorReplayBuffer(1000*args.test_num, args.test_num)
@@ -162,7 +168,7 @@ def test_codac(args=get_args()):
 
     # log
     now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
-    args.algo_name = "dsac"
+    args.algo_name = "codac"
     log_name = os.path.join(args.task, args.algo_name, args.risk_type, str(args.seed), now)
     log_path = os.path.join(args.logdir, log_name)
 

@@ -32,6 +32,13 @@ class ContinuousToDiscrete(gym.ActionWrapper):
         if len(act.shape) == 1:
             return np.array([self.mesh[i][a] for i, a in enumerate(act)])
         return np.array([[self.mesh[i][a] for i, a in enumerate(a_)] for a_ in act])
+    
+    def reverse_action(self, act: np.ndarray) -> np.ndarray:
+        # modify act
+        assert len(act.shape) <= 2, f"Unknown action format with shape {act.shape}."
+        if len(act.shape) == 1:
+            return np.array([np.argmin(np.abs(self.mesh[i] - a)) for i, a in enumerate(act)])
+        return np.array([[np.argmin(np.abs(self.mesh[i] - a)) for i, a in enumerate(a_)] for a_ in act])
 
 
 class MultiDiscreteToDiscrete(gym.ActionWrapper):
@@ -57,6 +64,8 @@ class MultiDiscreteToDiscrete(gym.ActionWrapper):
             act = act % b
         return np.array(converted_act).transpose()
 
+    def reverse_action(self, act: np.ndarray) -> np.ndarray:
+        return np.dot(act, self.bases[::-1])
 
 class TruncatedAsTerminated(gym.Wrapper):
     """A wrapper that set ``terminated = terminated or truncated`` for ``step()``.
