@@ -25,6 +25,8 @@ from tianshou.policy.imitation.base import ImitationPolicy
 from tianshou.policy.imitation.bcq import BCQPolicy
 from tianshou.policy.imitation.cql import CQLPolicy
 from tianshou.policy.imitation.rbve import RBVEPolicy
+from tianshou.policy.imitation.rdpg import RDPGPolicy
+from tianshou.policy.imitation.rdsac import RDSACPolicy
 from tianshou.policy.imitation.codac import CODACPolicy
 from tianshou.policy.imitation.td3_bc import TD3BCPolicy
 from tianshou.policy.imitation.discrete_bcq import DiscreteBCQPolicy
@@ -69,4 +71,6 @@ __all__ = [
     "ICMPolicy",
     "MultiAgentPolicyManager",
     "RBVEPolicy",
+    "RDPGPolicy",
+    "RDSACPolicy",
 ]

@@ -3,63 +3,135 @@
 import argparse
 import datetime
 import os
+import re
 import pprint
 
 import gymnasium as gym
 import numpy as np
-from tianshou.data.batch import Batch
 from tianshou.data.buffer.base import ReplayBuffer
 import torch
 from torch import nn
+from torch.distributions import Bernoulli
 from torch.utils.tensorboard import SummaryWriter
 
-from examples.offline.utils import load_buffer_d4rl
 from tianshou.data import Collector
+from tianshou.policy import CODACPolicy
 from tianshou.env import SubprocVectorEnv
-from tianshou.policy import RBVEPolicy
 from tianshou.trainer import OfflineTrainer
 from tianshou.utils import TensorboardLogger, WandbLogger
 from tianshou.utils.net.common import Net
-from tianshou.utils.net.continuous import ActorProb, Critic
+from tianshou.utils.net.continuous import ActorProb, QuantileMlp
+    
+class RewardHighVelocity(gym.RewardWrapper):
+    """Wrapper to modify environment rewards of 'Cheetah','Walker' and
+    'Hopper'.
 
+    Penalizes with certain probability if velocity of the agent is greater
+    than a predefined max velocity.
+    Parameters
+    ----------
+    kwargs: dict
+    with keys:
+    'prob_vel_penal': prob of penalization
+    'cost_vel': cost of penalization
+    'max_vel': max velocity
+
+    Methods
+    -------
+    step(action): next_state, reward, done, info
+    execute a step in the environment.
+    """
+
+    def __init__(self, env, **kwargs):
+        super(RewardHighVelocity, self).__init__(env)
+        self.penal_v_distr = Bernoulli(kwargs['prob_vel_penal'])
+        self.penal = kwargs['cost_vel']
+        self.max_vel = kwargs['max_vel']
+        self.max_step = kwargs['max_step']
+        self.step_count = 0
+        allowed_envs = ['Cheetah', 'Hopper', 'Walker']
+        assert(any(e in self.env.unwrapped.spec.id for e in allowed_envs)), \
+            'Env {self.env.unwrapped.spec.id} not allowed for RewardWrapper'
+
+    def step(self, action):
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        vel = self.env.sim.data.qvel[0]
+        info['risky_state'] = vel > self.max_vel
+        info['angle'] = self.env.sim.data.qpos[2]
+        self.step_count += 1
+
+        if self.step_count >= self.max_step:
+            terminated = True
+
+        if 'Cheetah' in self.env.unwrapped.spec.id:
+            return (observation, self.new_reward(reward, info),
+                     terminated, truncated, info)
+        if 'Walker' in self.env.unwrapped.spec.id:
+            return (observation, self.new_reward(reward, info),
+                     terminated, truncated, info)
+        if 'Hopper' in self.env.unwrapped.spec.id:
+            return (observation, self.new_reward(reward, info),
+                     terminated, truncated, info)
+
+    def new_reward(self, reward, info):
+        if 'Cheetah' in self.env.unwrapped.spec.id:
+            forward_reward = info['reward_run']
+        else:
+            forward_reward = info['x_velocity']
+
+        penal = info['risky_state'] * \
+            self.penal_v_distr.sample().item() * self.penal
+
+        # If penalty applied, substract the forward_reward from total_reward
+        # original_reward = rew_healthy + forward_reward - cntrl_cost
+        new_reward = penal + reward + (penal != 0) * (-forward_reward)
+        return new_reward
+
+    def reset(self, **kwargs):
+        self.step_count = 0
+        return self.env.reset(**kwargs)
+
+    @property
+    def name(self):
+        return f'{self.__class__.__name__}{self.env}'
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", type=str, default="Hopper-v2")
+    parser.add_argument("--task", type=str, default="HalfCheetah-v3")
+    parser.add_argument("--expert-data-task", type=str, default="/data/user/R901105/dev/my_fork/tianshou/tianshou_buffer_halfcheetah-medium-v0_prob0.05_vel4_cost-70.hdf5")
+    parser.add_argument("--max-step", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--expert-data-task", type=str, default="hopper-medium-v2")
-    parser.add_argument("--ac-path", type=str, default="/data/user/R901105/dev/log/Hopper-v2/action_classification/0/240428-110347/model.pt")
-    parser.add_argument("--ac-hidden-sizes", type=int, nargs="*", default=[512, 512, 512])
+    parser.add_argument("--risk-type", type=str, default="neutral")
     parser.add_argument("--buffer-size", type=int, default=1000000)
     parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256, 256])
     parser.add_argument("--actor-lr", type=float, default=3e-4)
-    parser.add_argument("--critic-lr", type=float, default=1e-4)
-    parser.add_argument("--q-marge", type=float, default=5.0)
+    parser.add_argument("--critic-lr", type=float, default=3e-5)
+    parser.add_argument("--n-taus", type=int, default=32)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--auto-alpha", default=True, action="store_true")
-    parser.add_argument("--alpha-lr", type=float, default=1e-4)
+    parser.add_argument("--alpha-lr", type=float, default=3e-4)
     parser.add_argument("--cql-alpha-lr", type=float, default=3e-4)
+    parser.add_argument("--cql-weight", type=float, default=10.0)
+    parser.add_argument("--with-lagrange", default=False, action="store_true")
+    parser.add_argument("--lagrange-threshold", type=float, default=10.0)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--start-timesteps", type=int, default=10000)
     parser.add_argument("--epoch", type=int, default=1000)
     parser.add_argument("--step-per-epoch", type=int, default=5000)
+    parser.add_argument("--step-per-collect", type=int, default=1)
+    parser.add_argument("--update-per-step", type=int, default=1)
+    parser.add_argument("--n-step", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--norm-layer", default=True, action=argparse.BooleanOptionalAction)
-
-    parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--cql-weight", type=float, default=5.0)
-    parser.add_argument("--with-lagrange", default=False, action="store_true")
-    parser.add_argument("--calibrated", default=False, action="store_true")
-    parser.add_argument("--lagrange-threshold", type=float, default=10.0)
-    parser.add_argument("--gamma", type=float, default=0.99)
-
-    parser.add_argument("--eval-freq", type=int, default=1)
+    parser.add_argument("--training-num", type=int, default=1)
     parser.add_argument("--test-num", type=int, default=10)
     parser.add_argument("--logdir", type=str, default="log")
-    parser.add_argument("--render", type=float, default=1 / 35)
+    parser.add_argument("--render", type=float, default=0.)
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
+    parser.add_argument("--gpu-to-use", type=int, default=0)
     parser.add_argument("--resume-path", type=str, default=None)
     parser.add_argument("--resume-id", type=str, default=None)
     parser.add_argument(
@@ -68,7 +140,7 @@ def get_args():
         default="tensorboard",
         choices=["tensorboard", "wandb"],
     )
-    parser.add_argument("--wandb-project", type=str, default="offline_d4rl.benchmark")
+    parser.add_argument("--wandb-project", type=str, default="mujoco.benchmark")
     parser.add_argument(
         "--watch",
         default=False,
@@ -77,70 +149,17 @@ def get_args():
     )
     return parser.parse_args()
 
-def add_returns(buffer: ReplayBuffer, gamma: float = 0.99) -> ReplayBuffer:
-    """Adds the returns for a given ReplayBuffer.
 
-    Args:
-        buffer: The ReplayBuffer to compute returns for.
-        gamma: The discount factor.
-
-    Returns:
-        A new ReplayBuffer with the returns.
-    """
-    data_dict = buffer._meta.__dict__
-    start_idx = np.concatenate([np.array([0]), np.where(data_dict["done"])[0] + 1])
-    end_idx = np.concatenate(
-        [np.where(data_dict["done"])[0] + 1, np.array([len(data_dict["done"])])]
-    )
-    ep_rew = [data_dict["rew"][i:j] for i, j in zip(start_idx, end_idx)]
-    ep_ret = []
-    for i in range(len(ep_rew)):
-        episode_rewards = ep_rew[i]
-        disc_returns = [0] * len(episode_rewards)
-        discounted_return = 0
-        for j in range(1, len(episode_rewards) + 1):
-            discounted_return = (
-                episode_rewards[len(episode_rewards) - j] + gamma * discounted_return
-            )
-            disc_returns[len(episode_rewards) - j] = discounted_return
-        ep_ret.append(disc_returns)
-
-    new_data_dict = data_dict.copy()
-    ep_rets = np.concatenate(ep_ret)
-    new_data_dict["MC_returns"] = ep_rets
-    new_batch = Batch(**new_data_dict)
-    buffer._meta = new_batch
-    return buffer
-
-class MyModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes):
-        super(MyModel, self).__init__()
-        self.input_layer = nn.Linear(input_size, hidden_sizes[0])
-        self.input_norm = nn.LayerNorm(hidden_sizes[0])
-        self.hidden_layers = nn.ModuleList([
-            nn.Linear(hidden_sizes[i], hidden_sizes[i+1])
-            for i in range(len(hidden_sizes) - 1)
-        ])
-        self.hidden_norms = nn.ModuleList([
-            nn.LayerNorm(hidden_sizes[i+1])
-            for i in range(len(hidden_sizes) - 1)
-        ])
-        self.output_layer = nn.Linear(hidden_sizes[-1], 1)  # 1 output for energy score
-    
-    def forward(self, x):
-        x = self.input_layer(x)
-        x = self.input_norm(x)
-        x = torch.relu(x)
-        for hidden_layer, hidden_norm in zip(self.hidden_layers, self.hidden_norms):
-            x = hidden_layer(x)
-            x = hidden_norm(x)
-            x = torch.relu(x)
-        output = self.output_layer(x)
-        return torch.sigmoid(output)
-
-def test_rbve():
+def test_rdsac(args=get_args()):
     args = get_args()
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu_to_use)
     env = gym.make(args.task)
+    match = re.search(r"_prob(\d+\.\d+)_vel(\d+)_cost-(\d+)", args.expert_data_task)
+    if match:
+        prob_vel_penal = float(match.group(1))
+        max_vel = int(match.group(2))
+        cost_vel = -int(match.group(3))
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
     args.max_action = env.action_space.high[0]  # float
@@ -155,18 +174,13 @@ def test_rbve():
 
     # test_envs = gym.make(args.task)
     test_envs = SubprocVectorEnv(
-        [lambda: gym.make(args.task) for _ in range(args.test_num)]
+        [lambda: RewardHighVelocity(gym.make(args.task), prob_vel_penal=prob_vel_penal, cost_vel=cost_vel, max_vel=max_vel, max_step=args.max_step) for _ in range(args.test_num)]
     )
     # seed
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     test_envs.seed(args.seed)
-
     # model
-    id_model = MyModel(args.state_dim + args.action_dim, args.ac_hidden_sizes).to(args.device)
-    id_model.load_state_dict(torch.load(args.ac_path))
-    print("Loaded AC model from:", args.ac_path)
-    # actor network
     net_a = Net(args.state_shape, hidden_sizes=args.hidden_sizes, device=args.device)
     actor = ActorProb(
         net_a,
@@ -177,26 +191,9 @@ def test_rbve():
     ).to(args.device)
     actor_optim = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
 
-    # critic network
-    net_c1 = Net(
-        args.state_shape,
-        args.action_shape,
-        hidden_sizes=args.hidden_sizes,
-        concat=True,
-        device=args.device,
-        norm_layer=nn.LayerNorm if args.norm_layer else None
-    )
-    net_c2 = Net(
-        args.state_shape,
-        args.action_shape,
-        hidden_sizes=args.hidden_sizes,
-        concat=True,
-        device=args.device,
-        norm_layer=nn.LayerNorm if args.norm_layer else None
-    )
-    critic1 = Critic(net_c1, device=args.device).to(args.device)
+    critic1 = QuantileMlp(hidden_sizes=args.hidden_sizes, input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
     critic1_optim = torch.optim.Adam(critic1.parameters(), lr=args.critic_lr)
-    critic2 = Critic(net_c2, device=args.device).to(args.device)
+    critic2 = QuantileMlp(hidden_sizes=args.hidden_sizes, input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
     critic2_optim = torch.optim.Adam(critic2.parameters(), lr=args.critic_lr)
 
     if args.auto_alpha:
@@ -205,15 +202,16 @@ def test_rbve():
         alpha_optim = torch.optim.Adam([log_alpha], lr=args.alpha_lr)
         args.alpha = (target_entropy, log_alpha, alpha_optim)
 
-    policy = RBVEPolicy(
-        actor,
-        actor_optim,
-        critic1,
-        critic1_optim,
-        critic2,
-        critic2_optim,
-        id_model=id_model,
+    policy = CODACPolicy(
+        actor=actor,
+        actor_optim=actor_optim,
+        critic1=critic1,
+        critic1_optim=critic1_optim,
+        critic2=critic2,
+        critic2_optim=critic2_optim,
         action_space=env.action_space,
+        risk_type=args.risk_type,
+        n_taus=args.n_taus,
         cql_alpha_lr=args.cql_alpha_lr,
         cql_weight=args.cql_weight,
         tau=args.tau,
@@ -224,8 +222,6 @@ def test_rbve():
         lagrange_threshold=args.lagrange_threshold,
         min_action=np.min(env.action_space.low),
         max_action=np.max(env.action_space.high),
-        calibrated=args.calibrated,
-        q_marge=args.q_marge,
         device=args.device,
     )
 
@@ -239,8 +235,8 @@ def test_rbve():
 
     # log
     now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
-    args.algo_name = "rbve"
-    log_name = os.path.join(args.task, args.algo_name, str(args.seed), now)
+    args.algo_name = "codac"
+    log_name = os.path.join(args.task, args.algo_name, args.risk_type, str(args.seed), now)
     log_path = os.path.join(args.logdir, log_name)
 
     # logger
@@ -274,7 +270,7 @@ def test_rbve():
         collector.collect(n_episode=1, render=1 / 35)
 
     if not args.watch:
-        replay_buffer = load_buffer_d4rl(args.expert_data_task)
+        replay_buffer = ReplayBuffer.load_hdf5(args.expert_data_task)
         # trainer
         result = OfflineTrainer(
             policy=policy,
@@ -300,4 +296,4 @@ def test_rbve():
 
 
 if __name__ == "__main__":
-    test_rbve()
+    test_rdsac()

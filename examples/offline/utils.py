@@ -51,3 +51,26 @@ def normalize_all_obs_in_replay_buffer(
     replay_buffer._meta["obs_next"] = (replay_buffer.obs_next -
                                        obs_rms.mean) / np.sqrt(obs_rms.var + _eps)
     return replay_buffer, obs_rms
+
+
+def stochastic_reward(
+        env_name: str,
+        env_dataset_name: str,
+        penalty: float, 
+        probability: float,
+        replay_buffer: ReplayBuffer) -> ReplayBuffer:
+    if "halfcheetah" in env_name.lower():
+        if ("medium" in env_dataset_name) or ("mixed" in env_dataset_name):
+            velocity_threshold = 4 
+        elif "expert" in env_dataset_name:
+            velocity_threshold = 10
+        else:
+            raise ValueError("Unknown dataset name")
+        velocity = replay_buffer.obs[:, 8]
+        risky_state = velocity > velocity_threshold
+        prob_mask = np.random.rand(len(velocity)) < probability
+        stochastic_penalty = risky_state * prob_mask * penalty
+        
+
+    replay_buffer.rew -= penalty
+    return replay_buffer

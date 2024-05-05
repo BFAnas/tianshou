@@ -7,110 +7,18 @@ import pprint
 
 import gymnasium as gym
 import numpy as np
-from tianshou.data.batch import Batch
-from tianshou.data.buffer.base import ReplayBuffer
 import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
 from examples.offline.utils import load_buffer_d4rl
 from tianshou.data import Collector
+from tianshou.policy import RDSACPolicy
 from tianshou.env import SubprocVectorEnv
-from tianshou.policy import RBVEPolicy
 from tianshou.trainer import OfflineTrainer
 from tianshou.utils import TensorboardLogger, WandbLogger
 from tianshou.utils.net.common import Net
-from tianshou.utils.net.continuous import ActorProb, Critic
-
-
-def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--task", type=str, default="Hopper-v2")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--expert-data-task", type=str, default="hopper-medium-v2")
-    parser.add_argument("--ac-path", type=str, default="/data/user/R901105/dev/log/Hopper-v2/action_classification/0/240428-110347/model.pt")
-    parser.add_argument("--ac-hidden-sizes", type=int, nargs="*", default=[512, 512, 512])
-    parser.add_argument("--buffer-size", type=int, default=1000000)
-    parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256, 256])
-    parser.add_argument("--actor-lr", type=float, default=3e-4)
-    parser.add_argument("--critic-lr", type=float, default=1e-4)
-    parser.add_argument("--q-marge", type=float, default=5.0)
-    parser.add_argument("--alpha", type=float, default=0.2)
-    parser.add_argument("--auto-alpha", default=True, action="store_true")
-    parser.add_argument("--alpha-lr", type=float, default=1e-4)
-    parser.add_argument("--cql-alpha-lr", type=float, default=3e-4)
-    parser.add_argument("--start-timesteps", type=int, default=10000)
-    parser.add_argument("--epoch", type=int, default=1000)
-    parser.add_argument("--step-per-epoch", type=int, default=5000)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--norm-layer", default=True, action=argparse.BooleanOptionalAction)
-
-    parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--cql-weight", type=float, default=5.0)
-    parser.add_argument("--with-lagrange", default=False, action="store_true")
-    parser.add_argument("--calibrated", default=False, action="store_true")
-    parser.add_argument("--lagrange-threshold", type=float, default=10.0)
-    parser.add_argument("--gamma", type=float, default=0.99)
-
-    parser.add_argument("--eval-freq", type=int, default=1)
-    parser.add_argument("--test-num", type=int, default=10)
-    parser.add_argument("--logdir", type=str, default="log")
-    parser.add_argument("--render", type=float, default=1 / 35)
-    parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
-    )
-    parser.add_argument("--resume-path", type=str, default=None)
-    parser.add_argument("--resume-id", type=str, default=None)
-    parser.add_argument(
-        "--logger",
-        type=str,
-        default="tensorboard",
-        choices=["tensorboard", "wandb"],
-    )
-    parser.add_argument("--wandb-project", type=str, default="offline_d4rl.benchmark")
-    parser.add_argument(
-        "--watch",
-        default=False,
-        action="store_true",
-        help="watch the play of pre-trained policy only",
-    )
-    return parser.parse_args()
-
-def add_returns(buffer: ReplayBuffer, gamma: float = 0.99) -> ReplayBuffer:
-    """Adds the returns for a given ReplayBuffer.
-
-    Args:
-        buffer: The ReplayBuffer to compute returns for.
-        gamma: The discount factor.
-
-    Returns:
-        A new ReplayBuffer with the returns.
-    """
-    data_dict = buffer._meta.__dict__
-    start_idx = np.concatenate([np.array([0]), np.where(data_dict["done"])[0] + 1])
-    end_idx = np.concatenate(
-        [np.where(data_dict["done"])[0] + 1, np.array([len(data_dict["done"])])]
-    )
-    ep_rew = [data_dict["rew"][i:j] for i, j in zip(start_idx, end_idx)]
-    ep_ret = []
-    for i in range(len(ep_rew)):
-        episode_rewards = ep_rew[i]
-        disc_returns = [0] * len(episode_rewards)
-        discounted_return = 0
-        for j in range(1, len(episode_rewards) + 1):
-            discounted_return = (
-                episode_rewards[len(episode_rewards) - j] + gamma * discounted_return
-            )
-            disc_returns[len(episode_rewards) - j] = discounted_return
-        ep_ret.append(disc_returns)
-
-    new_data_dict = data_dict.copy()
-    ep_rets = np.concatenate(ep_ret)
-    new_data_dict["MC_returns"] = ep_rets
-    new_batch = Batch(**new_data_dict)
-    buffer._meta = new_batch
-    return buffer
+from tianshou.utils.net.continuous import ActorProb, QuantileMlp
 
 class MyModel(nn.Module):
     def __init__(self, input_size, hidden_sizes):
@@ -138,8 +46,62 @@ class MyModel(nn.Module):
         output = self.output_layer(x)
         return torch.sigmoid(output)
 
-def test_rbve():
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", type=str, default="Hopper-v2")
+    parser.add_argument("--expert-data-task", type=str, default="hopper-medium-v2")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--ac-path", type=str, default="/data/user/R901105/dev/log/Hopper-v2/action_classification/0/240428-110347/model.pt")
+    parser.add_argument("--ac-hidden-sizes", type=int, nargs="*", default=[512, 512, 512])
+    parser.add_argument("--regularization-weight", type=float, default=0.01)
+    parser.add_argument("--q-marge", type=float, default=5.0)
+    parser.add_argument("--risk-type", type=str, default="neutral")
+    parser.add_argument("--buffer-size", type=int, default=1000000)
+    parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256, 256])
+    parser.add_argument("--actor-lr", type=float, default=1e-4)
+    parser.add_argument("--critic-lr", type=float, default=3e-4)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--tau", type=float, default=0.005)
+    parser.add_argument("--alpha", type=float, default=0.2)
+    parser.add_argument("--auto-alpha", default=True, action="store_true")
+    parser.add_argument("--alpha-lr", type=float, default=3e-4)
+    parser.add_argument("--start-timesteps", type=int, default=10000)
+    parser.add_argument("--epoch", type=int, default=1000)
+    parser.add_argument("--step-per-epoch", type=int, default=5000)
+    parser.add_argument("--step-per-collect", type=int, default=1)
+    parser.add_argument("--update-per-step", type=int, default=1)
+    parser.add_argument("--n-step", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--training-num", type=int, default=1)
+    parser.add_argument("--test-num", type=int, default=10)
+    parser.add_argument("--logdir", type=str, default="log")
+    parser.add_argument("--render", type=float, default=0.)
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument("--gpu-to-use", type=int, default=0)
+    parser.add_argument("--resume-path", type=str, default=None)
+    parser.add_argument("--resume-id", type=str, default=None)
+    parser.add_argument(
+        "--logger",
+        type=str,
+        default="tensorboard",
+        choices=["tensorboard", "wandb"],
+    )
+    parser.add_argument("--wandb-project", type=str, default="mujoco.benchmark")
+    parser.add_argument(
+        "--watch",
+        default=False,
+        action="store_true",
+        help="watch the play of pre-trained policy only",
+    )
+    return parser.parse_args()
+
+
+def test_rdsac(args=get_args()):
     args = get_args()
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu_to_use)
     env = gym.make(args.task)
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
@@ -161,12 +123,7 @@ def test_rbve():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     test_envs.seed(args.seed)
-
     # model
-    id_model = MyModel(args.state_dim + args.action_dim, args.ac_hidden_sizes).to(args.device)
-    id_model.load_state_dict(torch.load(args.ac_path))
-    print("Loaded AC model from:", args.ac_path)
-    # actor network
     net_a = Net(args.state_shape, hidden_sizes=args.hidden_sizes, device=args.device)
     actor = ActorProb(
         net_a,
@@ -177,27 +134,15 @@ def test_rbve():
     ).to(args.device)
     actor_optim = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
 
-    # critic network
-    net_c1 = Net(
-        args.state_shape,
-        args.action_shape,
-        hidden_sizes=args.hidden_sizes,
-        concat=True,
-        device=args.device,
-        norm_layer=nn.LayerNorm if args.norm_layer else None
-    )
-    net_c2 = Net(
-        args.state_shape,
-        args.action_shape,
-        hidden_sizes=args.hidden_sizes,
-        concat=True,
-        device=args.device,
-        norm_layer=nn.LayerNorm if args.norm_layer else None
-    )
-    critic1 = Critic(net_c1, device=args.device).to(args.device)
+    critic1 = QuantileMlp(hidden_sizes=args.hidden_sizes, input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
     critic1_optim = torch.optim.Adam(critic1.parameters(), lr=args.critic_lr)
-    critic2 = Critic(net_c2, device=args.device).to(args.device)
+    critic2 = QuantileMlp(hidden_sizes=args.hidden_sizes, input_size=args.state_shape[0] + args.action_shape[0], device=args.device).to(args.device)
     critic2_optim = torch.optim.Adam(critic2.parameters(), lr=args.critic_lr)
+
+    # action classifier
+    action_classifier = MyModel(args.state_dim + args.action_dim, args.ac_hidden_sizes).to(args.device)
+    action_classifier.load_state_dict(torch.load(args.ac_path))
+    print("Loaded AC model from:", args.ac_path)
 
     if args.auto_alpha:
         target_entropy = -np.prod(env.action_space.shape)
@@ -205,27 +150,22 @@ def test_rbve():
         alpha_optim = torch.optim.Adam([log_alpha], lr=args.alpha_lr)
         args.alpha = (target_entropy, log_alpha, alpha_optim)
 
-    policy = RBVEPolicy(
+    policy = RDSACPolicy(
         actor,
         actor_optim,
         critic1,
         critic1_optim,
         critic2,
         critic2_optim,
-        id_model=id_model,
-        action_space=env.action_space,
-        cql_alpha_lr=args.cql_alpha_lr,
-        cql_weight=args.cql_weight,
+        action_classifier,
+        regularization_weight=args.regularization_weight,
+        q_marge=args.q_marge,
+        risk_type=args.risk_type,
         tau=args.tau,
         gamma=args.gamma,
         alpha=args.alpha,
-        temperature=args.temperature,
-        with_lagrange=args.with_lagrange,
-        lagrange_threshold=args.lagrange_threshold,
-        min_action=np.min(env.action_space.low),
-        max_action=np.max(env.action_space.high),
-        calibrated=args.calibrated,
-        q_marge=args.q_marge,
+        estimation_step=args.n_step,
+        action_space=env.action_space,
         device=args.device,
     )
 
@@ -239,8 +179,8 @@ def test_rbve():
 
     # log
     now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
-    args.algo_name = "rbve"
-    log_name = os.path.join(args.task, args.algo_name, str(args.seed), now)
+    args.algo_name = "rdsac"
+    log_name = os.path.join(args.task, args.algo_name, args.risk_type, str(args.seed), now)
     log_path = os.path.join(args.logdir, log_name)
 
     # logger
@@ -300,4 +240,4 @@ def test_rbve():
 
 
 if __name__ == "__main__":
-    test_rbve()
+    test_rdsac()
